@@ -1,0 +1,93 @@
+{
+  "robot": {
+    "id": "ar3r_dm_g2",
+    "calibration_dir": null,
+    "cameras": {
+      "front": {
+        "fps": 30,
+        "width": 640,
+        "height": 480,
+        "serial_number": "CPC8563000HX",
+        "pixel_format": "AUTO",
+        "color_mode": "rgb",
+        "rotation": 0,
+        "buffer_size": 60,
+        "warmup_s": 1.0,
+        "startup_timeout_ms": 10000,
+        "startup_retry_count": 1,
+        "frame_timeout_ms": 1000
+      },
+      "wrist": {
+        "fps": 30,
+        "width": 640,
+        "height": 480,
+        "serial_number": "CV2856D000BV",
+        "pixel_format": "AUTO",
+        "color_mode": "rgb",
+        "rotation": 0,
+        "buffer_size": 60,
+        "warmup_s": 1.0,
+        "startup_timeout_ms": 10000,
+        "startup_retry_count": 1,
+        "frame_timeout_ms": 1000
+      }
+    },
+    "ros": {
+      "joint_names": [
+        "joint1",
+        "joint2",
+        "joint3",
+        "joint4",
+        "joint5",
+        "joint6",
+        "joint7"
+      ],
+      "state_topic": "/position_joint_trajectory_controller/controller_state",
+      "action_topic": "/position_joint_trajectory_controller/joint_trajectory",
+      "gripper_state_topic": "/v3_gripper/state",
+      "gripper_action_topic": "/v3_gripper/action",
+      "gripper_joint_name": "gripper",
+      "gripper_position_scale": 1.0,
+      "arm_effort_topic": "/joint_states",
+      "gripper_force_unit": "sdk_units",
+      "gripper_wrench_topics": {
+        "sensor_0": "/v3_gripper/tactile/sensor_0/wrench",
+        "sensor_2": "/v3_gripper/tactile/sensor_2/wrench"
+      },
+      "tactile_depth_topics": {
+        "sensor_0": "/v3_gripper/tactile/sensor_0/depth",
+        "sensor_2": "/v3_gripper/tactile/sensor_2/depth"
+      }
+    },
+    "sync_delay_s": 0.1,
+    "max_state_delta_s": 0.05,
+    "max_action_age_s": 0.2,
+    "max_camera_delta_s": 0.04,
+    "max_camera_skew_s": 0.04,
+    "max_gripper_age_s": 0.2,
+    "max_tactile_age_s": 0.2,
+    "tactile_recording": "native",
+    "training_schema": "force_aware"
+  },
+  "fps": 15,
+  "clock": "host_monotonic_receipt",
+  "signal_units": {
+    "arm_effort": "Nm",
+    "gripper_wrench": {
+      "components": [
+        "Fx",
+        "Fy",
+        "Fz",
+        "Mx",
+        "My",
+        "Mz"
+      ],
+      "units": "sdk_units",
+      "frame": "each tactile sensor's local SDK frame; not transformed to the arm frame"
+    },
+    "gripper_force_action": "V3 device force level 20..100, not newtons",
+    "tactile_depth": "raw SDK depth values, not calibrated millimetres",
+    "arm_position": "rad",
+    "gripper_position": "V3 SDK position 0..1000 (0 closed, 1000 open), not degrees"
+  }
+}

@@ -1,0 +1,385 @@
+{
+    "codebase_version": "v3.0",
+    "fps": 15,
+    "features": {
+        "observation.state": {
+            "dtype": "float32",
+            "shape": [
+                27
+            ],
+            "names": [
+                "joint1.pos",
+                "joint2.pos",
+                "joint3.pos",
+                "joint4.pos",
+                "joint5.pos",
+                "joint6.pos",
+                "joint7.pos",
+                "gripper.position_sdk",
+                "joint1.torque_Nm",
+                "joint2.torque_Nm",
+                "joint3.torque_Nm",
+                "joint4.torque_Nm",
+                "joint5.torque_Nm",
+                "joint6.torque_Nm",
+                "joint7.torque_Nm",
+                "gripper_wrench.sensor_0.Fx",
+                "gripper_wrench.sensor_0.Fy",
+                "gripper_wrench.sensor_0.Fz",
+                "gripper_wrench.sensor_0.Mx",
+                "gripper_wrench.sensor_0.My",
+                "gripper_wrench.sensor_0.Mz",
+                "gripper_wrench.sensor_2.Fx",
+                "gripper_wrench.sensor_2.Fy",
+                "gripper_wrench.sensor_2.Fz",
+                "gripper_wrench.sensor_2.Mx",
+                "gripper_wrench.sensor_2.My",
+                "gripper_wrench.sensor_2.Mz"
+            ]
+        },
+        "observation.state_valid": {
+            "dtype": "float32",
+            "shape": [
+                27
+            ],
+            "names": [
+                "joint1.pos",
+                "joint2.pos",
+                "joint3.pos",
+                "joint4.pos",
+                "joint5.pos",
+                "joint6.pos",
+                "joint7.pos",
+                "gripper.position_sdk",
+                "joint1.torque_Nm",
+                "joint2.torque_Nm",
+                "joint3.torque_Nm",
+                "joint4.torque_Nm",
+                "joint5.torque_Nm",
+                "joint6.torque_Nm",
+                "joint7.torque_Nm",
+                "gripper_wrench.sensor_0.Fx",
+                "gripper_wrench.sensor_0.Fy",
+                "gripper_wrench.sensor_0.Fz",
+                "gripper_wrench.sensor_0.Mx",
+                "gripper_wrench.sensor_0.My",
+                "gripper_wrench.sensor_0.Mz",
+                "gripper_wrench.sensor_2.Fx",
+                "gripper_wrench.sensor_2.Fy",
+                "gripper_wrench.sensor_2.Fz",
+                "gripper_wrench.sensor_2.Mx",
+                "gripper_wrench.sensor_2.My",
+                "gripper_wrench.sensor_2.Mz"
+            ]
+        },
+        "action": {
+            "dtype": "float32",
+            "shape": [
+                9
+            ],
+            "names": [
+                "joint1.pos",
+                "joint2.pos",
+                "joint3.pos",
+                "joint4.pos",
+                "joint5.pos",
+                "joint6.pos",
+                "joint7.pos",
+                "gripper.position_sdk",
+                "gripper.force_level"
+            ]
+        },
+        "action_valid": {
+            "dtype": "float32",
+            "shape": [
+                9
+            ],
+            "names": [
+                "joint1.pos",
+                "joint2.pos",
+                "joint3.pos",
+                "joint4.pos",
+                "joint5.pos",
+                "joint6.pos",
+                "joint7.pos",
+                "gripper.position_sdk",
+                "gripper.force_level"
+            ]
+        },
+        "observation.images.front": {
+            "dtype": "video",
+            "shape": [
+                480,
+                640,
+                3
+            ],
+            "names": [
+                "height",
+                "width",
+                "channels"
+            ],
+            "info": {
+                "video.height": 480,
+                "video.width": 640,
+                "video.codec": "h264",
+                "video.pix_fmt": "yuv420p",
+                "video.fps": 15,
+                "video.channels": 3,
+                "has_audio": false,
+                "video.g": 2,
+                "video.crf": 30,
+                "video.preset": "fast",
+                "video.fast_decode": 0,
+                "video.video_backend": "pyav",
+                "video.extra_options": {},
+                "is_depth_map": false
+            }
+        },
+        "sync.front.frame_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "observation.images.wrist": {
+            "dtype": "video",
+            "shape": [
+                480,
+                640,
+                3
+            ],
+            "names": [
+                "height",
+                "width",
+                "channels"
+            ],
+            "info": {
+                "video.height": 480,
+                "video.width": 640,
+                "video.codec": "h264",
+                "video.pix_fmt": "yuv420p",
+                "video.fps": 15,
+                "video.channels": 3,
+                "has_audio": false,
+                "video.g": 2,
+                "video.crf": 30,
+                "video.preset": "fast",
+                "video.fast_decode": 0,
+                "video.video_backend": "pyav",
+                "video.extra_options": {},
+                "is_depth_map": false
+            }
+        },
+        "sync.wrist.frame_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "observation.arm_effort": {
+            "dtype": "float32",
+            "shape": [
+                7
+            ],
+            "names": [
+                "joint1.torque_Nm",
+                "joint2.torque_Nm",
+                "joint3.torque_Nm",
+                "joint4.torque_Nm",
+                "joint5.torque_Nm",
+                "joint6.torque_Nm",
+                "joint7.torque_Nm"
+            ]
+        },
+        "observation.gripper_wrench.sensor_0": {
+            "dtype": "float32",
+            "shape": [
+                6
+            ],
+            "names": [
+                "Fx",
+                "Fy",
+                "Fz",
+                "Mx",
+                "My",
+                "Mz"
+            ]
+        },
+        "observation.gripper_wrench.sensor_2": {
+            "dtype": "float32",
+            "shape": [
+                6
+            ],
+            "names": [
+                "Fx",
+                "Fy",
+                "Fz",
+                "Mx",
+                "My",
+                "Mz"
+            ]
+        },
+        "sync.target_host_s": {
+            "dtype": "float64",
+            "shape": [
+                1
+            ],
+            "names": [
+                "monotonic"
+            ]
+        },
+        "sync.state_host_bracket_s": {
+            "dtype": "float64",
+            "shape": [
+                2
+            ],
+            "names": [
+                "left",
+                "right"
+            ]
+        },
+        "sync.state_source_s": {
+            "dtype": "float64",
+            "shape": [
+                1
+            ],
+            "names": [
+                "interpolated_ros_stamp"
+            ]
+        },
+        "sync.action_timing_s": {
+            "dtype": "float64",
+            "shape": [
+                3
+            ],
+            "names": [
+                "host_receipt",
+                "ros_stamp",
+                "command_horizon"
+            ]
+        },
+        "sync.gripper_timing_s": {
+            "dtype": "float64",
+            "shape": [
+                4
+            ],
+            "names": [
+                "state_host",
+                "state_source",
+                "action_host",
+                "action_source"
+            ]
+        },
+        "sync.front.timing_s": {
+            "dtype": "float64",
+            "shape": [
+                3
+            ],
+            "names": [
+                "host_receipt",
+                "device_timestamp",
+                "offset_from_target"
+            ]
+        },
+        "sync.wrist.timing_s": {
+            "dtype": "float64",
+            "shape": [
+                3
+            ],
+            "names": [
+                "host_receipt",
+                "device_timestamp",
+                "offset_from_target"
+            ]
+        },
+        "sync.arm_effort.timing_s": {
+            "dtype": "float64",
+            "shape": [
+                2
+            ],
+            "names": [
+                "host_receipt",
+                "ros_stamp"
+            ]
+        },
+        "sync.gripper_force_action.timing_s": {
+            "dtype": "float64",
+            "shape": [
+                2
+            ],
+            "names": [
+                "host_receipt",
+                "ros_stamp"
+            ]
+        },
+        "sync.gripper_wrench.sensor_0.timing_s": {
+            "dtype": "float64",
+            "shape": [
+                2
+            ],
+            "names": [
+                "host_receipt",
+                "ros_stamp"
+            ]
+        },
+        "sync.gripper_wrench.sensor_2.timing_s": {
+            "dtype": "float64",
+            "shape": [
+                2
+            ],
+            "names": [
+                "host_receipt",
+                "ros_stamp"
+            ]
+        },
+        "timestamp": {
+            "dtype": "float32",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "frame_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "episode_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "task_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        }
+    },
+    "total_episodes": 19,
+    "total_frames": 8550,
+    "total_tasks": 1,
+    "chunks_size": 1000,
+    "data_files_size_in_mb": 100,
+    "video_files_size_in_mb": 200,
+    "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+    "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+    "robot_type": "rokae_ar3",
+    "splits": {
+        "train": "0:19"
+    }
+}

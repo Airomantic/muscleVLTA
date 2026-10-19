@@ -1,0 +1,107 @@
+{
+  "version": 1,
+  "episode_index": 0,
+  "clock": "host_monotonic_receipt",
+  "interval": "[start_host_s, end_host_s)",
+  "start_host_s": 18259.062134041,
+  "end_host_s": 18289.062134041,
+  "duration_s": 30.0,
+  "max_fps": 30.0,
+  "peak_pending_bytes": 8848704,
+  "streams": {
+    "gripper_wrench.sensor_0": {
+      "dtype": "float32",
+      "shape": [
+        6
+      ],
+      "names": [
+        "Fx",
+        "Fy",
+        "Fz",
+        "Mx",
+        "My",
+        "Mz"
+      ],
+      "topic": "/v3_gripper/tactile/sensor_0/wrench",
+      "count": 787,
+      "first_host_s": 18259.070871055,
+      "last_host_s": 18289.040630522,
+      "max_gap_s": 0.051896556997235166,
+      "received_count": 3569,
+      "rate_limited_count": 2782,
+      "received_rate_hz": 118.9975418564034,
+      "recorded_rate_hz": 26.22643671416452,
+      "start_gap_s": 0.008737013999052579,
+      "end_gap_s": 0.021503519001271343
+    },
+    "gripper_wrench.sensor_2": {
+      "dtype": "float32",
+      "shape": [
+        6
+      ],
+      "names": [
+        "Fx",
+        "Fy",
+        "Fz",
+        "Mx",
+        "My",
+        "Mz"
+      ],
+      "topic": "/v3_gripper/tactile/sensor_2/wrench",
+      "count": 785,
+      "first_host_s": 18259.067655954,
+      "last_host_s": 18289.026407053,
+      "max_gap_s": 0.050367985997581854,
+      "received_count": 3555,
+      "rate_limited_count": 2770,
+      "received_rate_hz": 118.52115441673774,
+      "recorded_rate_hz": 26.169315183041974,
+      "start_gap_s": 0.005521913000848144,
+      "end_gap_s": 0.03572698800053331
+    },
+    "tactile_depth.sensor_0": {
+      "dtype": "float32",
+      "shape": [
+        288,
+        384
+      ],
+      "names": [
+        "height",
+        "width"
+      ],
+      "topic": "/v3_gripper/tactile/sensor_0/depth",
+      "count": 783,
+      "first_host_s": 18259.071039947,
+      "last_host_s": 18289.05130455,
+      "max_gap_s": 0.05252254799779621,
+      "received_count": 3548,
+      "rate_limited_count": 2765,
+      "received_rate_hz": 118.29747488273792,
+      "recorded_rate_hz": 26.083825821928937,
+      "start_gap_s": 0.008905906001018593,
+      "end_gap_s": 0.010829490998730762
+    },
+    "tactile_depth.sensor_2": {
+      "dtype": "float32",
+      "shape": [
+        288,
+        384
+      ],
+      "names": [
+        "height",
+        "width"
+      ],
+      "topic": "/v3_gripper/tactile/sensor_2/depth",
+      "count": 784,
+      "first_host_s": 18259.067831161,
+      "last_host_s": 18289.025705321,
+      "max_gap_s": 0.05062681299750693,
+      "received_count": 3536,
+      "rate_limited_count": 2752,
+      "received_rate_hz": 117.8878355085773,
+      "recorded_rate_hz": 26.136701016169717,
+      "start_gap_s": 0.005697119999240385,
+      "end_gap_s": 0.03642871999909403
+    }
+  }
+}
