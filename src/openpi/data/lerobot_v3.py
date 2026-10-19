@@ -471,7 +471,9 @@ class LeRobotV3Dataset:
             }
             path = cache_dir / f"episode_{episode_index:06d}.npy"
             signature_path = path.with_suffix(".json")
-            if not (path.is_file() and signature_path.is_file() and json.loads(signature_path.read_text()) == signature):
+            if not (
+                path.is_file() and signature_path.is_file() and json.loads(signature_path.read_text()) == signature
+            ):
                 logger.info("Building tactile cache for episode %d in %s", episode_index, cache_dir)
                 array = np.stack(
                     [

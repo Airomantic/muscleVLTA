@@ -46,8 +46,8 @@ from openpi.policies.flexiv_transforms import ACTION_NAMES
 import openpi.policies.single_iphone_flexiv_policy as single_iphone_flexiv_policy
 import openpi.shared.download as _download
 from openpi.shared.episode_schema import DEFAULT_INTERVENTION_VALUE
-import openpi.shared.normalize as _normalize
 import openpi.shared.nnx_utils as nnx_utils
+import openpi.shared.normalize as _normalize
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms

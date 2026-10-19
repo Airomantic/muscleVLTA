@@ -53,9 +53,7 @@ FINGER_WRENCH_KEYS = ("observation/finger_wrench_0", "observation/finger_wrench_
 TACTILE_KEY = "observation/tactile_depth"
 
 
-def make_ar3_force_visuotactile_example(
-    action_horizon: int = 15, tactile_shape: tuple[int, int] = (288, 384)
-) -> dict:
+def make_ar3_force_visuotactile_example(action_horizon: int = 15, tactile_shape: tuple[int, int] = (288, 384)) -> dict:
     """Creates a random inference example as sent by the robot client (single force / tactile readings)."""
     return {
         FRONT_IMAGE_KEY: np.random.randint(256, size=(480, 640, 3), dtype=np.uint8),
