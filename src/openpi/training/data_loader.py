@@ -18,6 +18,7 @@ from lerobot.common.datasets.utils import get_episode_data_index
 import numpy as np
 import torch
 
+import openpi.data.lerobot_v3 as _lerobot_v3
 import openpi.models.model as _model
 from openpi.shared.episode_schema import CONTROL_FLAG_FEATURE_NAME
 from openpi.shared.episode_schema import CONTROL_FLAG_FEATURE_SPEC
@@ -104,6 +105,8 @@ def create_torch_dataset(
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
+    if data_config.lerobot_v3 is not None or _lerobot_v3.is_lerobot_v3_dataset(repo_id):
+        return _create_lerobot_v3_dataset(data_config, action_horizon)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     available_features = set(dataset_meta.features)
@@ -125,6 +128,35 @@ def create_torch_dataset(
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
+    return dataset
+
+
+def _create_lerobot_v3_dataset(data_config: _config.DataConfig, action_horizon: int) -> Dataset:
+    """Creates a dataset over a local LeRobot v3.0 dataset with the native reader (see openpi.data.lerobot_v3)."""
+    repo_id = data_config.repo_id
+    dataset_meta = _lerobot_v3.LeRobotV3Metadata(repo_id)
+    available_features = set(dataset_meta.numeric_keys)
+    sequence_keys = tuple(key for key in data_config.action_sequence_keys if key in available_features)
+    if sequence_keys != tuple(data_config.action_sequence_keys):
+        missing_keys = tuple(key for key in data_config.action_sequence_keys if key not in available_features)
+        logging.info(
+            "Dataset %s does not contain optional sequence keys %s; loading the available keys only.",
+            repo_id,
+            missing_keys,
+        )
+    if not data_config.action_sequence_keys or data_config.action_sequence_keys[0] not in sequence_keys:
+        raise ValueError(
+            f"Dataset {repo_id} does not contain the action feature {data_config.action_sequence_keys[:1]}. "
+            f"Numeric features: {sorted(available_features)}"
+        )
+    dataset = _lerobot_v3.LeRobotV3Dataset(
+        repo_id,
+        sequence_keys=sequence_keys,
+        sequence_length=action_horizon,
+        options=data_config.lerobot_v3,
+    )
+    if data_config.prompt_from_task:
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
     return dataset
 
 

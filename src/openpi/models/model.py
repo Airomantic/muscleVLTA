@@ -89,6 +89,8 @@ class Observation(Generic[ArrayT]):
     state: at.Float[ArrayT, "*b s"]
     wrench: at.Float[ArrayT, "*b t q"] | None = None
     wrench_mask: at.Bool[ArrayT, "*b"] | None = None
+    # Optional visuo-tactile images over the action horizon: [*b, time, sensors, height, width].
+    tactile: at.Float[ArrayT, "*b t tn th tw"] | None = None
 
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
@@ -111,6 +113,7 @@ class Observation(Generic[ArrayT]):
             state=data["state"],
             wrench=data.get("wrench"),
             wrench_mask=data.get("wrench_mask"),
+            tactile=data.get("tactile"),
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
         )
@@ -193,6 +196,7 @@ def preprocess_observation(
         state=observation.state,
         wrench=observation.wrench,
         wrench_mask=observation.wrench_mask,
+        tactile=observation.tactile,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
     )

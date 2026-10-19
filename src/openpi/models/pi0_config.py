@@ -31,6 +31,15 @@ class Pi0Config(_model.BaseModelConfig):
     # Use the same value in the inference config as in the training ablation.
     use_force_history: bool = True
     use_state: bool = True
+    # Size of the per-step force readings fed to the reactive / residual force encoder, e.g. 6 for an end-effector
+    # wrench or 19 for 7 joint torques + two 6D finger wrenches (AR3 + visuo-tactile gripper).
+    force_dim: int = 6
+    # Fuse visuo-tactile images [batch, action_horizon, num_sensors, height, width] into the reactive force memory
+    # through a small CNN (requires reactive_in_use).
+    tactile_in_use: bool = False
+    tactile_num_sensors: int = 2
+    tactile_shape: tuple[int, int] = (72, 96)
+    tactile_feature_dim: int = 64
 
     # The residual branch reuses the frozen base-policy SigLIP. These settings
     # control only the trainable correction decoder and wrench encoder.
@@ -60,6 +69,13 @@ class Pi0Config(_model.BaseModelConfig):
     def __post_init__(self):
         if self.reactive_in_use and self.residual_policy_in_use:
             raise ValueError("reactive_in_use and residual_policy_in_use cannot both be enabled.")
+        if self.force_dim <= 0:
+            raise ValueError("force_dim must be positive.")
+        if self.tactile_in_use:
+            if not self.reactive_in_use:
+                raise ValueError("tactile_in_use requires reactive_in_use.")
+            if self.tactile_num_sensors <= 0 or self.tactile_feature_dim <= 0 or min(self.tactile_shape) <= 0:
+                raise ValueError("tactile_num_sensors, tactile_feature_dim and tactile_shape must be positive.")
         if self.residual_policy_in_use:
             if not self.residual_image_keys:
                 raise ValueError("residual_image_keys must contain at least one image key.")
@@ -99,8 +115,15 @@ class Pi0Config(_model.BaseModelConfig):
 
         with at.disable_typechecking():
             wrench_spec = (
-                jax.ShapeDtypeStruct([batch_size, self.action_horizon, 6], jnp.float32)
+                jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.force_dim], jnp.float32)
                 if self.reactive_in_use or self.residual_policy_in_use
+                else None
+            )
+            tactile_spec = (
+                jax.ShapeDtypeStruct(
+                    [batch_size, self.action_horizon, self.tactile_num_sensors, *self.tactile_shape], jnp.float32
+                )
+                if self.tactile_in_use
                 else None
             )
             observation_spec = _model.Observation(
@@ -116,6 +139,7 @@ class Pi0Config(_model.BaseModelConfig):
                 },
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 wrench=wrench_spec,
+                tactile=tactile_spec,
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
             )

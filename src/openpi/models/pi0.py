@@ -15,6 +15,7 @@ from openpi.models import residual_policy as _residual_policy
 import openpi.models.gemma as _gemma
 from openpi.models.gru import create_gru_network as gru
 import openpi.models.siglip as _siglip
+from openpi.models.tactile import create_tactile_encoder
 from openpi.shared import array_typing as at
 import openpi.shared.jax_debug as _jax_debug
 
@@ -34,6 +35,7 @@ def create_residual_policy_submodule(config: pi0_config.Pi0Config, rngs: nnx.Rng
         hidden_size=config.residual_wrench_hidden_dim,
         output_size=config.residual_width,
         action_horizon=config.action_horizon,
+        input_size=config.force_dim,
     )
     residual_wrench_gru.lazy_init(rngs=rngs, method="init")
     residual_core = _residual_policy.create_residual_policy_core(
@@ -154,6 +156,9 @@ class Pi0(_model.BaseModel):
         self.original_head = config.original_head
         self.use_force_history = config.use_force_history
         self.cross_attention_latency = config.cross_attention_latency
+        self.force_dim = config.force_dim
+        self.tactile_in_use = config.tactile_in_use
+        self.tactile_feature_size = config.tactile_num_sensors * config.tactile_feature_dim
         self.residual_image_keys = config.residual_image_keys
         self.residual_action_dim = len(config.residual_action_scale) if config.residual_policy_in_use else 0
         self.residual_action_scale = (
@@ -197,10 +202,22 @@ class Pi0(_model.BaseModel):
 
         model_parts = {"llm": llm, "img": img}
         if config.reactive_in_use:
+            # Per-step force readings, optionally concatenated with tactile image features, are encoded by a GRU into
+            # the memory tokens of the reactive expert's cross-attention.
+            gru_input_size = config.force_dim
+            if config.tactile_in_use:
+                tactile_encoder = create_tactile_encoder(config.tactile_feature_dim)
+                tactile_encoder.lazy_init(
+                    jnp.zeros((1, config.action_horizon, config.tactile_num_sensors, *config.tactile_shape)),
+                    rngs=rngs,
+                )
+                model_parts["tactile_encoder"] = tactile_encoder
+                gru_input_size += self.tactile_feature_size
             wrench_gru = gru(
                 hidden_size=action_expert_config.width // 2,
                 output_size=action_expert_config.width,
                 action_horizon=config.action_horizon,
+                input_size=gru_input_size,
             )
             wrench_gru.lazy_init(rngs=rngs, method="init")
             model_parts["wrench_gru"] = wrench_gru
@@ -325,27 +342,35 @@ class Pi0(_model.BaseModel):
         return cross_attn_mask, cross_positions
 
     def _get_wrench_memory(self, observation: _model.Observation):
+        batch_size = observation.state.shape[0]
         if observation.wrench is None:
-            batch_size = observation.state.shape[0]
-            wrench = jnp.zeros((batch_size, self.action_horizon, 6), dtype=observation.state.dtype)
+            wrench = jnp.zeros((batch_size, self.action_horizon, self.force_dim), dtype=observation.state.dtype)
         else:
             wrench = observation.wrench
         wrench_mask = self._get_wrench_mask(observation)
         if self.residual_policy_in_use:
             return self.residual_policy.wrench_gru(wrench) * wrench_mask[:, None, None]
+        if self.tactile_in_use:
+            if observation.tactile is None:
+                tactile_features = jnp.zeros((batch_size, wrench.shape[1], self.tactile_feature_size), jnp.float32)
+            else:
+                tactile_features = self.PaliGemma.tactile_encoder(observation.tactile)
+            wrench = jnp.concatenate([wrench.astype(jnp.float32), tactile_features], axis=-1)
         return self.PaliGemma.wrench_gru(wrench) * wrench_mask[:, None, None]
 
     def _get_wrench_mask(self, observation: _model.Observation):
         if observation.wrench is None:
             batch_size = observation.state.shape[0]
-            return jnp.zeros((batch_size,), dtype=jnp.bool_)
+            # Without force readings the memory is only used if tactile images are available (tactile-only ablation).
+            has_tactile = self.tactile_in_use and observation.tactile is not None
+            return jnp.full((batch_size,), has_tactile, dtype=jnp.bool_)
         if observation.wrench_mask is None:
             return jnp.ones((observation.wrench.shape[0],), dtype=jnp.bool_)
         return observation.wrench_mask
 
     def _get_residual_wrench_memory(self, wrench, wrench_mask, batch_size: int):
         if wrench is None:
-            wrench = jnp.zeros((batch_size, self.action_horizon, 6), dtype=jnp.float32)
+            wrench = jnp.zeros((batch_size, self.action_horizon, self.force_dim), dtype=jnp.float32)
             wrench_mask = jnp.zeros((batch_size,), dtype=jnp.bool_)
         else:
             wrench = jnp.asarray(wrench, dtype=jnp.float32)

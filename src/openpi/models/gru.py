@@ -20,6 +20,8 @@ class _LinenGRUNetwork(nn.Module):
     hidden_size: int
     output_size: int
     action_horizon: int
+    # Size of the per-step input features (6 for an end-effector wrench).
+    input_size: int = 6
 
     @nn.compact
     def __call__(self, inputs, initial_state=None):
@@ -43,9 +45,11 @@ class _LinenGRUNetwork(nn.Module):
         return jnp.array(outputs, dtype=jnp.bfloat16)
 
     def init(self):
-        self(jnp.zeros((1, self.action_horizon, 6)))
+        self(jnp.zeros((1, self.action_horizon, self.input_size)))
 
 
-def create_gru_network(hidden_size: int, output_size: int, action_horizon: int):
-    linen_mod = _LinenGRUNetwork(hidden_size=hidden_size, output_size=output_size, action_horizon=action_horizon)
+def create_gru_network(hidden_size: int, output_size: int, action_horizon: int, input_size: int = 6):
+    linen_mod = _LinenGRUNetwork(
+        hidden_size=hidden_size, output_size=output_size, action_horizon=action_horizon, input_size=input_size
+    )
     return nnx_bridge.ToNNX(linen_mod)
