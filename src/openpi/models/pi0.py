@@ -7,6 +7,7 @@ import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
 import jax
 import jax.numpy as jnp
+import numpy as np
 from typing_extensions import override
 
 from openpi.models import model as _model
@@ -14,6 +15,9 @@ from openpi.models import pi0_config
 from openpi.models import residual_policy as _residual_policy
 import openpi.models.gemma as _gemma
 from openpi.models.gru import create_gru_network as gru
+from openpi.models.mot import create_multirate_mot
+from openpi.models.mot import tactile_pooling_matrix
+from openpi.models.mot import tactile_token_times
 import openpi.models.siglip as _siglip
 from openpi.models.tactile import create_tactile_encoder
 from openpi.shared import array_typing as at
@@ -116,6 +120,17 @@ def make_reactive_attn_mask(input_mask, ar_mask, spec_modules):
     return jnp.logical_and(attn_mask, valid_mask)
 
 
+def make_multirate_cross_attn_mask(batch_size, q_len, memory_times, latency, *, use_force_history: bool = True):
+    """Reactive query i sees memory tokens whose frame time <= i - latency (one extra step with a state token)."""
+    memory_times = np.asarray(memory_times)
+    offset = 1 if q_len == int(memory_times.max()) + 2 else 0
+    query = np.arange(q_len)[:, None] - latency - offset
+    mask = memory_times[None, :] <= query
+    if not use_force_history:
+        mask &= memory_times[None, :] == 0
+    return jnp.broadcast_to(jnp.asarray(mask)[None, None], (batch_size, 1, q_len, len(memory_times)))
+
+
 def make_cross_attn_mask(spec_modules, *, use_force_history: bool = True):
     batch_size, s1, s2, s3 = spec_modules
     attn_mask = jnp.zeros((batch_size, 1, s1, s2), dtype=bool)
@@ -159,6 +174,15 @@ class Pi0(_model.BaseModel):
         self.force_dim = config.force_dim
         self.tactile_in_use = config.tactile_in_use
         self.tactile_feature_size = config.tactile_num_sensors * config.tactile_feature_dim
+        self.force_encoder = config.force_encoder if config.reactive_in_use else "gru"
+        # Frame time of every reactive memory token (force tokens first, then the low-rate tactile tokens).
+        # Stored as tuples: nnx module attributes that are not variables must be hashable.
+        self.memory_times = tuple(range(config.action_horizon))
+        self.tactile_pooling = None
+        if self.force_encoder == "mot" and config.tactile_in_use:
+            pooling = tactile_pooling_matrix(config.action_horizon, config.tactile_stride)
+            self.tactile_pooling = tuple(map(tuple, pooling.tolist()))
+            self.memory_times += tactile_token_times(config.action_horizon, config.tactile_stride)
         self.residual_image_keys = config.residual_image_keys
         self.residual_action_dim = len(config.residual_action_scale) if config.residual_policy_in_use else 0
         self.residual_action_scale = (
@@ -202,9 +226,6 @@ class Pi0(_model.BaseModel):
 
         model_parts = {"llm": llm, "img": img}
         if config.reactive_in_use:
-            # Per-step force readings, optionally concatenated with tactile image features, are encoded by a GRU into
-            # the memory tokens of the reactive expert's cross-attention.
-            gru_input_size = config.force_dim
             if config.tactile_in_use:
                 tactile_encoder = create_tactile_encoder(config.tactile_feature_dim)
                 tactile_encoder.lazy_init(
@@ -212,15 +233,37 @@ class Pi0(_model.BaseModel):
                     rngs=rngs,
                 )
                 model_parts["tactile_encoder"] = tactile_encoder
-                gru_input_size += self.tactile_feature_size
-            wrench_gru = gru(
-                hidden_size=action_expert_config.width // 2,
-                output_size=action_expert_config.width,
-                action_horizon=config.action_horizon,
-                input_size=gru_input_size,
-            )
-            wrench_gru.lazy_init(rngs=rngs, method="init")
-            model_parts["wrench_gru"] = wrench_gru
+            if self.force_encoder == "mot":
+                # Fast force expert (every frame) + slow tactile expert (every tactile_stride frames) sharing one
+                # time-causal self-attention; their tokens form the memory of the reactive expert's cross-attention.
+                modalities, times, input_sizes = ["force"], [tuple(range(config.action_horizon))], [config.force_dim]
+                if config.tactile_in_use:
+                    modalities.append("tactile")
+                    times.append(tactile_token_times(config.action_horizon, config.tactile_stride))
+                    input_sizes.append(self.tactile_feature_size)
+                force_mot = create_multirate_mot(
+                    modalities=tuple(modalities),
+                    times=tuple(times),
+                    input_sizes=tuple(input_sizes),
+                    output_size=action_expert_config.width,
+                    width=config.mot_width,
+                    depth=config.mot_depth,
+                    num_heads=config.mot_num_heads,
+                )
+                force_mot.lazy_init(rngs=rngs, method="init_shapes")
+                model_parts["force_mot"] = force_mot
+            else:
+                # Per-step force readings, optionally concatenated with tactile image features, are encoded by a GRU
+                # into the memory tokens of the reactive expert's cross-attention.
+                gru_input_size = config.force_dim + (self.tactile_feature_size if config.tactile_in_use else 0)
+                wrench_gru = gru(
+                    hidden_size=action_expert_config.width // 2,
+                    output_size=action_expert_config.width,
+                    action_horizon=config.action_horizon,
+                    input_size=gru_input_size,
+                )
+                wrench_gru.lazy_init(rngs=rngs, method="init")
+                model_parts["wrench_gru"] = wrench_gru
         self.PaliGemma = nnx.Dict(**model_parts)
 
         if config.residual_policy_in_use:
@@ -331,6 +374,21 @@ class Pi0(_model.BaseModel):
         else:
             cross_special_modules = [batch_size, self.action_horizon, self.action_horizon, self.cross_attention_latency]
             q_len = self.action_horizon
+        if self.force_encoder == "mot":
+            cross_attn_mask = make_multirate_cross_attn_mask(
+                batch_size,
+                q_len,
+                self.memory_times,
+                self.cross_attention_latency,
+                use_force_history=self.use_force_history,
+            )
+            memory_positions = jnp.broadcast_to(
+                jnp.asarray(self.memory_times, jnp.int32), (batch_size, len(self.memory_times))
+            )
+            return cross_attn_mask, [
+                jnp.broadcast_to(jnp.arange(q_len, dtype=jnp.int32), (batch_size, q_len)),
+                memory_positions,
+            ]
         cross_attn_mask = make_cross_attn_mask(
             cross_special_modules,
             use_force_history=self.use_force_history,
@@ -350,13 +408,23 @@ class Pi0(_model.BaseModel):
         wrench_mask = self._get_wrench_mask(observation)
         if self.residual_policy_in_use:
             return self.residual_policy.wrench_gru(wrench) * wrench_mask[:, None, None]
+        tactile_features = None
         if self.tactile_in_use:
             if observation.tactile is None:
                 tactile_features = jnp.zeros((batch_size, wrench.shape[1], self.tactile_feature_size), jnp.float32)
             else:
                 tactile_features = self.PaliGemma.tactile_encoder(observation.tactile)
-            wrench = jnp.concatenate([wrench.astype(jnp.float32), tactile_features], axis=-1)
-        return self.PaliGemma.wrench_gru(wrench) * wrench_mask[:, None, None]
+        if self.force_encoder == "mot":
+            streams = [wrench.astype(jnp.float32)]
+            if tactile_features is not None:
+                pooling = jnp.asarray(self.tactile_pooling, dtype=jnp.float32)
+                streams.append(jnp.einsum("jt,btd->bjd", pooling, tactile_features))
+            memory = self.PaliGemma.force_mot(streams)
+        else:
+            if tactile_features is not None:
+                wrench = jnp.concatenate([wrench.astype(jnp.float32), tactile_features], axis=-1)
+            memory = self.PaliGemma.wrench_gru(wrench)
+        return memory * wrench_mask[:, None, None]
 
     def _get_wrench_mask(self, observation: _model.Observation):
         if observation.wrench is None:

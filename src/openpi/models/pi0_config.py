@@ -40,6 +40,16 @@ class Pi0Config(_model.BaseModelConfig):
     tactile_num_sensors: int = 2
     tactile_shape: tuple[int, int] = (72, 96)
     tactile_feature_dim: int = 64
+    # Encoder of the reactive force / tactile memory:
+    # - "gru": a single GRU over the per-step force readings (+ tactile features), one memory token per frame (LIFT).
+    # - "mot": multi-rate mixture-of-transformers with a fast force expert (one token per frame) and a slow tactile
+    #   expert (one token per tactile_stride frames, causally pooled), see openpi.models.mot.
+    force_encoder: str = "gru"
+    # Frames per slow tactile token of the "mot" force encoder (e.g. 3 -> 5 Hz tokens on a 15 fps dataset).
+    tactile_stride: int = 3
+    mot_width: int = 256
+    mot_depth: int = 2
+    mot_num_heads: int = 4
 
     # The residual branch reuses the frozen base-policy SigLIP. These settings
     # control only the trainable correction decoder and wrench encoder.
@@ -76,6 +86,13 @@ class Pi0Config(_model.BaseModelConfig):
                 raise ValueError("tactile_in_use requires reactive_in_use.")
             if self.tactile_num_sensors <= 0 or self.tactile_feature_dim <= 0 or min(self.tactile_shape) <= 0:
                 raise ValueError("tactile_num_sensors, tactile_feature_dim and tactile_shape must be positive.")
+        if self.force_encoder not in ("gru", "mot"):
+            raise ValueError(f"force_encoder must be 'gru' or 'mot', got {self.force_encoder!r}.")
+        if self.force_encoder == "mot":
+            if self.tactile_stride <= 0 or self.mot_depth <= 0:
+                raise ValueError("tactile_stride and mot_depth must be positive.")
+            if self.mot_width % self.mot_num_heads != 0 or (self.mot_width // self.mot_num_heads) % 2 != 0:
+                raise ValueError("mot_width must be divisible by mot_num_heads (with an even head dim).")
         if self.residual_policy_in_use:
             if not self.residual_image_keys:
                 raise ValueError("residual_image_keys must contain at least one image key.")

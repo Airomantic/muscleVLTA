@@ -8,7 +8,10 @@ Dataset (LeRobot v3.0, 15 fps) features used for training:
   force channels are fed to the reactive force branch instead (late force injection, see LIFT).
 * ``action`` (9D): 7 joint position targets [rad], gripper position target (0..1000), gripper force level (20..100).
 * ``observation.arm_effort`` (7D) and ``observation.gripper_wrench.sensor_{0,2}`` (6D each, Fx Fy Fz Mx My Mz in each
-  finger sensor's own SDK frame) form the 19D force sequence of the reactive branch.
+  finger sensor's own SDK frame) form the 19D measured force sequence of the reactive branch. The commanded gripper
+  force level (``action[..., 8]`` during training, ``observation/force_level`` at inference) is appended after
+  normalization with its fixed 20..100 range (it is constant in many recordings, so quantile statistics would be
+  degenerate), giving the 20D force input of the model (MODEL_FORCE_DIM).
 * ``observation.tactile_depth`` (optional, native sidecars): visuo-tactile depth images of the two fingers.
 
 The two finger sensors face each other, so their local frames are mirrored. The raw local frames are kept by default:
@@ -40,9 +43,17 @@ FORCE_NAMES = (
 )
 TACTILE_SENSORS = ("sensor_0", "sensor_2")
 
+FORCE_LEVEL_NAME = "gripper.force_level"
+# Range of the gripper force level command (SDK units), mapped linearly to [-1, 1].
+FORCE_LEVEL_RANGE = (20.0, 100.0)
+FORCE_LEVEL_ACTION_INDEX = ACTION_NAMES.index(FORCE_LEVEL_NAME)
+
 STATE_DIM = len(STATE_NAMES)
 ACTION_DIM = len(ACTION_NAMES)
+# Measured force channels (normalized with the dataset statistics under the "wrench" key).
 FORCE_DIM = len(FORCE_NAMES)
+# Force input of the model: measured force channels + commanded gripper force level.
+MODEL_FORCE_DIM = FORCE_DIM + 1
 
 # Keys produced by the dataset repack transform (training) and expected from the robot client (inference).
 FRONT_IMAGE_KEY = "observation/front_image"
@@ -51,6 +62,8 @@ STATE_KEY = "observation/state"
 ARM_EFFORT_KEY = "observation/arm_effort"
 FINGER_WRENCH_KEYS = ("observation/finger_wrench_0", "observation/finger_wrench_2")
 TACTILE_KEY = "observation/tactile_depth"
+# Commanded gripper force level (scalar or [horizon] sequence) sent by the robot client at inference.
+FORCE_LEVEL_KEY = "observation/force_level"
 
 
 def make_ar3_force_visuotactile_example(action_horizon: int = 15, tactile_shape: tuple[int, int] = (288, 384)) -> dict:
@@ -63,6 +76,7 @@ def make_ar3_force_visuotactile_example(action_horizon: int = 15, tactile_shape:
         FINGER_WRENCH_KEYS[0]: np.random.randn(6).astype(np.float32),
         FINGER_WRENCH_KEYS[1]: np.random.randn(6).astype(np.float32),
         TACTILE_KEY: np.random.rand(len(TACTILE_SENSORS), *tactile_shape).astype(np.float32),
+        FORCE_LEVEL_KEY: np.float32(80.0),
         "prompt": "Unplug the white charging plug from the white socket and place it on the table",
     }
 
@@ -111,6 +125,10 @@ class AR3ForceVisuotactileInputs(transforms.DataTransformFn):
     tactile_gain: float = 10.0
     # Optional row-major 3x3 rotation that maps sensor_2 force / moment vectors into the sensor_0 frame.
     finger_wrench_2_rotation: tuple[float, ...] | None = None
+    # Provide the commanded gripper force level ("force_level", appended to the force input by AR3AppendForceLevel).
+    use_force_level: bool = True
+    # Force level used at inference when the client does not send observation/force_level.
+    default_force_level: float = 80.0
 
     def __call__(self, data: dict) -> dict:
         front_image = _parse_image(data[FRONT_IMAGE_KEY])
@@ -143,6 +161,8 @@ class AR3ForceVisuotactileInputs(transforms.DataTransformFn):
 
         if self.use_force and (wrench := self._force(data)) is not None:
             inputs["wrench"] = wrench
+            if self.use_force_level:
+                inputs["force_level"] = self._force_level(data)
             if "wrench_mask" in data:
                 inputs["wrench_mask"] = np.asarray(data["wrench_mask"], dtype=bool)
 
@@ -171,6 +191,18 @@ class AR3ForceVisuotactileInputs(transforms.DataTransformFn):
             wrench_2 = np.concatenate([wrench_2[:, :3] @ rotation.T, wrench_2[:, 3:] @ rotation.T], axis=-1)
         return np.concatenate([effort, wrench_0, wrench_2], axis=-1)
 
+    def _force_level(self, data: dict) -> np.ndarray:
+        if FORCE_LEVEL_KEY in data:
+            level = np.asarray(data[FORCE_LEVEL_KEY], dtype=np.float32).reshape(-1, 1)
+        elif "actions" in data:
+            # Training: the commanded force level of every step of the chunk (absolute, unaffected by delta actions).
+            level = np.asarray(data["actions"], dtype=np.float32)[
+                ..., FORCE_LEVEL_ACTION_INDEX : FORCE_LEVEL_ACTION_INDEX + 1
+            ]
+        else:
+            level = np.full((1, 1), self.default_force_level, dtype=np.float32)
+        return _to_sequence(level, self.action_horizon, item_ndim=1)
+
     def _tactile(self, value) -> np.ndarray:
         tactile = _to_sequence(value, self.action_horizon, item_ndim=3)
         height, width = self.tactile_resolution
@@ -182,6 +214,24 @@ class AR3ForceVisuotactileInputs(transforms.DataTransformFn):
                 ]
             )
         return np.log1p(self.tactile_gain * np.maximum(tactile, 0.0)).astype(np.float32)
+
+
+@dataclasses.dataclass(frozen=True)
+class AR3AppendForceLevel(transforms.DataTransformFn):
+    """Appends the commanded gripper force level, scaled to [-1, 1], to the normalized force input.
+
+    Runs after normalization (model transforms): wrench [horizon, FORCE_DIM] -> [horizon, MODEL_FORCE_DIM].
+    """
+
+    def __call__(self, data: dict) -> dict:
+        if "force_level" not in data:
+            return data
+        data = dict(data)
+        low, high = FORCE_LEVEL_RANGE
+        level = (np.asarray(data.pop("force_level"), dtype=np.float32) - low) / (high - low) * 2.0 - 1.0
+        if "wrench" in data:
+            data["wrench"] = np.concatenate([np.asarray(data["wrench"], dtype=np.float32), level], axis=-1)
+        return data
 
 
 @dataclasses.dataclass(frozen=True)

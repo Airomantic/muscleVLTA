@@ -94,6 +94,23 @@ Dependencies are specified in `pyproject.toml` and pinned in `uv.lock`.
    Task presets and data transforms are in `src/openpi/training/config.py`;
    training overrides and resume instructions are documented in [scripts/train.py](scripts/train.py).
 
+### AR3 force + visuo-tactile (muscleVLTA, LeRobot v3.0)
+
+The AR3 recordings (15 fps, 7 joints + gripper, 9D actions with gripper force level, 7 joint torques, two finger
+6D wrenches and tactile depth sidecars) are read natively as LeRobot v3.0 (no conversion needed). The reactive expert
+cross-attends to a multi-rate mixture-of-transformers memory: a fast force expert over the 20D force sequence
+(7 torques + 2×6D finger wrenches + gripper force level, one token per frame) and a slow tactile expert
+(one token per `tactile_stride` frames). Main config: `pi05_ar3_force_visuotactile_reactive`
+(ablations `pi05_ar3_force_reactive`, `pi05_ar3_base`; CPU smoke test `pi05_ar3_force_visuotactile_reactive_debug`).
+
+```bash
+# Computes norm stats on first run, then trains on GPUs 6,7 (FSDP over 2 devices).
+bash scripts/train_ar3_force_visuotactile_gpu67.sh
+```
+
+See the script header for overrides (dataset, weights, GPUs, batch size, resume). At inference, send
+`observation/force_level` (the commanded gripper force level) in addition to the force and tactile readings.
+
 ## 🔄 Online DAgger Launchers
 
 The online loop consists of policy inference, human correction, data transfer,

@@ -73,7 +73,9 @@ _DEFAULT_AR3_REPO_ID = os.environ.get(
     "OPENPI_AR3_REPO_ID", "/data/jiang/utilData/ar3_force_computeChargingPullOut_force_aware"
 )
 _DEFAULT_AR3_ASSET_ID = os.environ.get("OPENPI_AR3_ASSET_ID", "ar3_force_computeChargingPullOut_force_aware")
-_DEFAULT_AR3_WEIGHT_PATH = os.environ.get("OPENPI_AR3_WEIGHT_PATH", "gs://openpi-assets/checkpoints/pi05_base/params")
+_DEFAULT_AR3_WEIGHT_PATH = os.environ.get(
+    "OPENPI_AR3_WEIGHT_PATH", "/data/jiang/checkpoints/openpi-assets/checkpoints/pi05_base/params"
+)
 # Single-episode example of the AR3 dataset shipped with the repository (used by the CPU debug config).
 _AR3_EXAMPLE_REPO_ID = str(pathlib.Path(__file__).resolve().parents[3] / "dataset_example")
 
@@ -306,7 +308,8 @@ class LeRobotAR3ForceVisuotactileDataConfig(DataConfigFactory):
     The v3.0 dataset is read natively (openpi.data.lerobot_v3), no conversion to v2.1 is needed. Proprioception is
     the 7 joint positions + gripper position, actions are 7 joint position targets (relative to the current joints
     if delta_joint_actions) + absolute gripper position + gripper force level. Force-aware models (reactive_in_use)
-    additionally receive the 19D force sequence (7 joint torques + the 6D wrenches of both finger sensors) over the
+    additionally receive the 20D force sequence (7 joint torques + the 6D wrenches of both finger sensors + the gripper
+    force level, see use_force_level) over the
     action horizon, and models with tactile_in_use the tactile depth images of both fingers (aligned causally to the
     15 fps frames, downsampled to Pi0Config.tactile_shape and cached on first use). See
     src/openpi/policies/ar3_force_visuotactile_policy.py for the exact layout.
@@ -328,6 +331,8 @@ class LeRobotAR3ForceVisuotactileDataConfig(DataConfigFactory):
     tactile_gain: float = 10.0
     # Optional row-major 3x3 rotation expressing the sensor_2 wrench in the sensor_0 frame (None keeps raw frames).
     finger_wrench_2_rotation: tuple[float, ...] | None = None
+    # Append the commanded gripper force level (action dim 8) to the 19D measured force input (-> 20D).
+    use_force_level: bool = True
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -336,8 +341,12 @@ class LeRobotAR3ForceVisuotactileDataConfig(DataConfigFactory):
             getattr(model_config, "reactive_in_use", False) or getattr(model_config, "residual_policy_in_use", False)
         )
         use_tactile = bool(getattr(model_config, "tactile_in_use", False))
-        if use_force and getattr(model_config, "force_dim", ar3.FORCE_DIM) != ar3.FORCE_DIM:
-            raise ValueError(f"AR3 force inputs are {ar3.FORCE_DIM}D {ar3.FORCE_NAMES}; set Pi0Config.force_dim.")
+        expected_force_dim = ar3.MODEL_FORCE_DIM if self.use_force_level else ar3.FORCE_DIM
+        if use_force and getattr(model_config, "force_dim", expected_force_dim) != expected_force_dim:
+            raise ValueError(
+                f"AR3 force inputs are {expected_force_dim}D ({ar3.FORCE_NAMES}"
+                f"{' + ' + ar3.FORCE_LEVEL_NAME if self.use_force_level else ''}); set Pi0Config.force_dim."
+            )
         if use_tactile and getattr(model_config, "tactile_num_sensors", None) != len(ar3.TACTILE_SENSORS):
             raise ValueError(f"AR3 tactile inputs come from {ar3.TACTILE_SENSORS}; set Pi0Config.tactile_num_sensors.")
 
@@ -376,6 +385,7 @@ class LeRobotAR3ForceVisuotactileDataConfig(DataConfigFactory):
                     tactile_resolution=tuple(getattr(model_config, "tactile_shape", (72, 96))),
                     tactile_gain=self.tactile_gain,
                     finger_wrench_2_rotation=self.finger_wrench_2_rotation,
+                    use_force_level=self.use_force_level,
                 )
             ],
             outputs=[ar3.AR3ForceVisuotactileOutputs()],
@@ -393,7 +403,7 @@ class LeRobotAR3ForceVisuotactileDataConfig(DataConfigFactory):
             action_sequence_keys=tuple(sequence_keys),
             repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform(repack_structure)]),
             data_transforms=data_transforms,
-            model_transforms=ModelTransformFactory()(model_config),
+            model_transforms=ModelTransformFactory()(model_config).push(inputs=[ar3.AR3AppendForceLevel()]),
             lerobot_v3=_lerobot_v3.LeRobotV3Options(
                 video_keys=(self.front_video_key, self.wrist_video_key),
                 missing_video=self.missing_video,
@@ -627,9 +637,11 @@ pi05_residual_debug = dataclasses.replace(
     residual_wrench_hidden_dim=32,
 )
 
-# AR3 force + visuo-tactile (muscleVLTA, 15 fps). The action chunk covers 1 s. The reactive action expert reads the
-# 19D force sequence (7 joint torques + both finger wrenches) and the tactile depth features of both fingers through
-# causal cross-attention with a 3 step (0.2 s) latency, like the LIFT reactive policy.
+# AR3 force + visuo-tactile (muscleVLTA, 15 fps). The action chunk covers 1 s. The reactive action expert reads, through
+# causal cross-attention with a 3 step (0.2 s) latency like the LIFT reactive policy, the memory of a multi-rate
+# mixture-of-transformers: a fast force expert over the 20D force sequence (7 joint torques + both finger wrenches +
+# gripper force level, one token per frame) and a slow tactile expert over the tactile depth features of both fingers
+# (one token per 3 frames = 5 Hz).
 pi05_ar3_force_visuotactile_reactive = pi0_config.Pi0Config(
     pi05=True,
     action_horizon=15,
@@ -638,7 +650,12 @@ pi05_ar3_force_visuotactile_reactive = pi0_config.Pi0Config(
     use_state=False,
     original_head=False,
     cross_attention_latency=3,
-    force_dim=ar3_force_visuotactile_policy.FORCE_DIM,
+    force_dim=ar3_force_visuotactile_policy.MODEL_FORCE_DIM,
+    force_encoder="mot",
+    tactile_stride=3,
+    mot_width=256,
+    mot_depth=2,
+    mot_num_heads=4,
     tactile_in_use=True,
     tactile_num_sensors=len(ar3_force_visuotactile_policy.TACTILE_SENSORS),
     tactile_shape=(72, 96),
@@ -979,6 +996,9 @@ _CONFIGS = [
             action_horizon=4,
             cross_attention_latency=1,
             tactile_feature_dim=16,
+            tactile_stride=2,
+            mot_width=32,
+            mot_depth=1,
         ),
         data=LeRobotAR3ForceVisuotactileDataConfig(
             repo_id=_AR3_EXAMPLE_REPO_ID,
