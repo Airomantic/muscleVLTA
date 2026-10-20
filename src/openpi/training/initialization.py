@@ -122,12 +122,15 @@ def init_train_state(
 
     partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.params.to_pure_dict())
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    # Place the loaded weights directly in their FSDP shards instead of replicating the full checkpoint on every device.
+    partial_sharding = sharding.fsdp_sharding(partial_params, mesh)
+    partial_params = jax.device_put(partial_params, partial_sharding)
 
     # Initialize the train state and mix in the partial params.
     train_state = jax.jit(
         init,
         donate_argnums=(1,),  # donate the partial params buffer.
-        in_shardings=replicated_sharding,
+        in_shardings=(replicated_sharding, partial_sharding),
         out_shardings=state_sharding,
     )(init_rng, partial_params)
 

@@ -108,7 +108,15 @@ cross-attends to a multi-rate mixture-of-transformers memory: a fast force exper
 bash scripts/train_ar3_force_visuotactile_gpu67.sh
 ```
 
-See the script header for overrides (dataset, weights, GPUs, batch size, resume). At inference, send
+On shared GPUs with only a few GB free, use the low-memory launcher instead (config
+`pi05_ar3_force_visuotactile_reactive_lowmem`: LoRA experts, frozen SigLIP, batch 4; waits for free memory, caps JAX at
+free memory minus 2 GB and auto-resumes after OOM):
+
+```bash
+bash scripts/train_ar3_force_visuotactile_gpu67_lowmem.sh
+```
+
+See the script headers for overrides (dataset, weights, GPUs, batch size, resume). At inference, send
 `observation/force_level` (the commanded gripper force level) in addition to the force and tactile readings.
 
 ## 🔄 Online DAgger Launchers

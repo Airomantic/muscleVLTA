@@ -662,6 +662,13 @@ pi05_ar3_force_visuotactile_reactive = pi0_config.Pi0Config(
     tactile_feature_dim=64,
 )
 
+pi05_ar3_force_visuotactile_reactive_lora = dataclasses.replace(
+    pi05_ar3_force_visuotactile_reactive,
+    paligemma_variant="gemma_2b_lora",
+    action_expert_variant="gemma_300m_lora",
+    reactive_action_expert_variant="gemma_300m_lora",
+)
+
 
 def _ar3_train_config(name: str, model: pi0_config.Pi0Config, **kwargs: Any) -> TrainConfig:
     """Full fine-tuning of pi05_base on the AR3 force + visuo-tactile dataset (LIFT reactive recipe)."""
@@ -983,6 +990,19 @@ _CONFIGS = [
     _ar3_train_config(
         "pi05_ar3_base",
         dataclasses.replace(pi05_ar3_force_visuotactile_reactive, reactive_in_use=False, tactile_in_use=False),
+    ),
+    # Low-memory variant for shared GPUs (~8 GB free per GPU): LoRA on all Gemma experts, frozen (bf16) SigLIP,
+    # no EMA and a small batch. The MoT force / tactile memory and the tactile encoder are trained fully.
+    _ar3_train_config(
+        "pi05_ar3_force_visuotactile_reactive_lowmem",
+        pi05_ar3_force_visuotactile_reactive_lora,
+        freeze_filter=nnx.Any(
+            pi05_ar3_force_visuotactile_reactive_lora.get_freeze_filter(), nnx_utils.PathRegex(".*img.*")
+        ),
+        batch_size=4,
+        num_workers=4,
+        ema_decay=None,
+        save_interval=500,
     ),
     # CPU smoke test on the single-episode dataset_example (no videos -> black frames, random tiny model).
     TrainConfig(
