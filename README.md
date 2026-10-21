@@ -134,19 +134,22 @@ OPENPI_SERVE_GPU=7 bash scripts/serve_ar3_force_visuotactile.sh \
 The server is unauthenticated and only listens on localhost by default. Reach it from the robot PC through an SSH
 tunnel (`ssh -N -L 8000:127.0.0.1:8000 <server>`), or set `OPENPI_HOST=0.0.0.0` on a trusted network only.
 
-[scripts/ar3_force_visuotactile_client_example.py](scripts/ar3_force_visuotactile_client_example.py) is a robot-side
-client that only needs `numpy` and `openpi-client`; replace `FakeAR3Robot` by the real drivers. Inputs (one frame,
-or `(t, ...)` sequences for the force / tactile keys in reactive mode):
+[scripts/ar3_force_visuotactile_client_example.py](scripts/ar3_force_visuotactile_client_example.py) is the
+robot-side client. `--source` selects where observations come from: `dataset` replays a recorded episode, `fake`
+sends random data, and `MODULE:CLASS` loads your robot driver. A driver is a class constructed without arguments,
+with `observe() -> dict` (the keys below) and `execute(action)`, plus optional `done` and `close()`. The client
+itself needs only `numpy` and `openpi-client`. Inputs are one frame per request, or `(t, ...)` sequences for the
+force / tactile keys in reactive mode:
 
 | Key | Shape | Content |
 | --- | --- | --- |
 | `observation/front_image`, `observation/wrist_image` | (H, W, 3) uint8 | RGB images |
 | `observation/state` | (8,) | 7 joint positions [rad] + gripper position (0..1000) |
 | `observation/arm_effort` | (7,) | measured joint torques [Nm] |
-| `observation/finger_wrench_0`, `observation/finger_wrench_2` | (6,) | finger wrenches Fx Fy Fz [N] Mx My Mz [Nm], each in its own (mirrored) sensor frame as recorded |
-| `observation/tactile_depth` | (2, h, w) float32 | tactile depth of both fingers (downsample to the `tactile_shape` from the server metadata to save bandwidth) |
+| `observation/finger_wrench_0`, `observation/finger_wrench_2` | (6,) | finger wrenches Fx Fy Fz Mx My Mz in the SDK units of the recording, each in its own (mirrored) sensor frame |
+| `observation/tactile_depth` | (2, h, w) | tactile depth of both fingers. The client area-downsamples it to the server's `tactile_shape` and sends float16, the same values as the training cache. |
 | `observation/force_level` | scalar | current gripper force level command (20..100) |
-| `prompt` | str | task instruction (optional with the launcher, which sets a default prompt) |
+| `prompt` | str | task instruction. Optional: replay uses the episode task, and the launcher sets a default prompt. |
 
 The policy returns `actions` of shape `(n, 9)`: 7 absolute joint position targets [rad], gripper position (0..1000) and
 gripper force level (20..100) at 15 fps. Joint torques and finger wrenches are inputs only: the recordings contain no
@@ -154,8 +157,9 @@ torque commands, so the policy does not predict joint forces; contact forces res
 targets with the commanded force level.
 
 ```bash
-python scripts/ar3_force_visuotactile_client_example.py --host 127.0.0.1 --port 8000           # reactive mode
-python scripts/ar3_force_visuotactile_client_example.py --mode chunk --execute-steps 10        # plain chunking
+python scripts/ar3_force_visuotactile_client_example.py --source my_ar3:AR3Robot               # reactive mode
+python scripts/ar3_force_visuotactile_client_example.py --source my_ar3:AR3Robot --mode chunk --execute-steps 10
+python scripts/ar3_force_visuotactile_client_example.py --source fake --max-steps 30            # connection test
 ```
 
 - `chunk`: one full inference (VLM + both experts) per action chunk.
@@ -164,6 +168,39 @@ python scripts/ar3_force_visuotactile_client_example.py --mode chunk --execute-s
   (`reactive_step`), so the remaining actions of the chunk react to contact. The server keeps the chunk state per
   connection; actions only depend on readings at least `cross_attention_latency` steps old, so streaming gives the same
   actions as re-running the whole chunk with the full readings.
+- Before execution, the client clips each joint target to the measured joint position ± `--max-joint-step` (default
+  0.1 rad). It also clips the gripper target to 0..1000 and the force level to 20..100. The robot driver is still
+  responsible for joint, workspace and velocity limits.
+
+Replaying a recorded episode is an offline check of a checkpoint. It uses the same path as the robot: the WebSocket
+connection, the transforms and reactive streaming. The replay is open loop: each recorded frame is sent, and the
+predicted actions are compared with the recorded ones. Run it on the GPU server in the openpi environment, which
+already contains `rerun-sdk` 0.23.1:
+
+```bash
+uv run scripts/ar3_force_visuotactile_client_example.py --source dataset \
+  --dataset /data/jiang/utilData/ar3_force_computeChargingPullOut_force_aware --episode 16 \
+  --output-dir replay/episode_16 --rerun replay/episode_16.rrd
+```
+
+The summary reports the inference latency and the errors against the recorded actions:
+
+- joint MAE in degrees, per joint and averaged, shown next to the hold-position baseline (keeping the current joints)
+- gripper and force level MAE
+- joint MAE for each step of the chunk
+
+`--output-dir` writes `rollout.npz` (state and policy / executed / recorded actions for each step) and
+`summary.json`.
+
+The `.rrd` file uses the panels of the dataset viewer: cameras, gripper, force level, state / action, arm effort,
+finger wrenches and tactile depth. It adds the policy actions, a "policy vs recorded" tab for each joint and the
+inference latency. Open it with the same rerun version that wrote it (`uvx --from rerun-sdk==0.23.1 rerun
+replay/episode_16.rrd`). You can also stream to a running viewer with `--rerun rerun+http://HOST:9876/proxy`, or open
+one with `--rerun spawn`.
+
+On the robot PC, install the client with `pip install --no-deps -e packages/openpi-client` plus `msgpack websockets
+pillow dm-tree typing_extensions`. This avoids downgrading numpy in an existing numpy 2 environment, because
+openpi-client pins `numpy<2`.
 
 ## 🔄 Online DAgger Launchers
 

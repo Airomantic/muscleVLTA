@@ -722,7 +722,7 @@ class RerunLogger:
             )
 
     def close(self) -> None:
-        self._recording.flush(blocking=True)
+        self._recording.flush()  # Blocks until sent (the flush arguments differ between rerun versions).
         self._recording.disconnect()
 
 
