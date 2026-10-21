@@ -119,6 +119,52 @@ bash scripts/train_ar3_force_visuotactile_gpu67_lowmem.sh
 See the script headers for overrides (dataset, weights, GPUs, batch size, resume). At inference, send
 `observation/force_level` (the commanded gripper force level) in addition to the force and tactile readings.
 
+#### AR3 inference
+
+Serve a trained checkpoint (defaults to the latest step of the newest `pi05_ar3_force_visuotactile_reactive_lowmem`
+run, GPU 6, `127.0.0.1:8000`; the header of the script lists all overrides):
+
+```bash
+bash scripts/serve_ar3_force_visuotactile.sh
+# Explicit step directory, another GPU (or OPENPI_SERVE_GPU=cpu), extra serve_policy.py arguments last:
+OPENPI_SERVE_GPU=7 bash scripts/serve_ar3_force_visuotactile.sh \
+  checkpoints/pi05_ar3_force_visuotactile_reactive_lowmem/<run>/<step> --record
+```
+
+The server is unauthenticated and only listens on localhost by default. Reach it from the robot PC through an SSH
+tunnel (`ssh -N -L 8000:127.0.0.1:8000 <server>`), or set `OPENPI_HOST=0.0.0.0` on a trusted network only.
+
+[scripts/ar3_force_visuotactile_client_example.py](scripts/ar3_force_visuotactile_client_example.py) is a robot-side
+client that only needs `numpy` and `openpi-client`; replace `FakeAR3Robot` by the real drivers. Inputs (one frame,
+or `(t, ...)` sequences for the force / tactile keys in reactive mode):
+
+| Key | Shape | Content |
+| --- | --- | --- |
+| `observation/front_image`, `observation/wrist_image` | (H, W, 3) uint8 | RGB images |
+| `observation/state` | (8,) | 7 joint positions [rad] + gripper position (0..1000) |
+| `observation/arm_effort` | (7,) | measured joint torques [Nm] |
+| `observation/finger_wrench_0`, `observation/finger_wrench_2` | (6,) | finger wrenches Fx Fy Fz [N] Mx My Mz [Nm], each in its own (mirrored) sensor frame as recorded |
+| `observation/tactile_depth` | (2, h, w) float32 | tactile depth of both fingers (downsample to the `tactile_shape` from the server metadata to save bandwidth) |
+| `observation/force_level` | scalar | current gripper force level command (20..100) |
+| `prompt` | str | task instruction (optional with the launcher, which sets a default prompt) |
+
+The policy returns `actions` of shape `(n, 9)`: 7 absolute joint position targets [rad], gripper position (0..1000) and
+gripper force level (20..100) at 15 fps. Joint torques and finger wrenches are inputs only: the recordings contain no
+torque commands, so the policy does not predict joint forces; contact forces result from tracking the joint / gripper
+targets with the commanded force level.
+
+```bash
+python scripts/ar3_force_visuotactile_client_example.py --host 127.0.0.1 --port 8000           # reactive mode
+python scripts/ar3_force_visuotactile_client_example.py --mode chunk --execute-steps 10        # plain chunking
+```
+
+- `chunk`: one full inference (VLM + both experts) per action chunk.
+- `reactive` (default for reactive configs): the VLM runs once per chunk (`reactive_replan`), then the reactive expert
+  is re-run every `k = cross_attention_latency + 1` steps with all force / tactile readings since the chunk start
+  (`reactive_step`), so the remaining actions of the chunk react to contact. The server keeps the chunk state per
+  connection; actions only depend on readings at least `cross_attention_latency` steps old, so streaming gives the same
+  actions as re-running the whole chunk with the full readings.
+
 ## 🔄 Online DAgger Launchers
 
 The online loop consists of policy inference, human correction, data transfer,

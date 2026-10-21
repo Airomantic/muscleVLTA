@@ -329,7 +329,18 @@ class PolicyRecorder(_base_policy.BasePolicy):
     @override
     def infer(self, obs: dict) -> dict:  # type: ignore[misc]
         results = self._policy.infer(obs)
+        self._record(obs, results)
+        return results
 
+    def reactive_replan(self, obs: dict, **kwargs) -> dict:
+        return self._policy.reactive_replan(obs, **kwargs)
+
+    def reactive_get_k_actions(self, *, obs: dict, **kwargs) -> dict:
+        results = self._policy.reactive_get_k_actions(obs=obs, **kwargs)
+        self._record(obs, results)
+        return results
+
+    def _record(self, obs: dict, results: dict) -> None:
         data = {"inputs": obs, "outputs": results}
         data = flax.traverse_util.flatten_dict(data, sep="/")
 
@@ -337,4 +348,3 @@ class PolicyRecorder(_base_policy.BasePolicy):
         self._record_step += 1
 
         np.save(output_path, np.asarray(data))
-        return results

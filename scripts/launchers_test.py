@@ -117,3 +117,66 @@ def test_ratio_ablation_is_strict_and_uses_selected_task_name(launcher_env):
     assert "--no-allow-offline-warm-start" in arguments
     assert arguments[arguments.index("--exp-name") + 1].startswith("custom_task_ratio_1to2_")
     assert arguments[arguments.index("--task-description") + 1] == ""
+
+
+def _ar3_checkpoint(run_dir, step, asset_id="ar3_assets"):
+    step_dir = run_dir / str(step)
+    (step_dir / "params").mkdir(parents=True)
+    (step_dir / "assets" / asset_id).mkdir(parents=True)
+    (step_dir / "assets" / asset_id / "norm_stats.json").write_text("{}")
+    return step_dir
+
+
+@pytest.fixture
+def serve_env(launcher_env, tmp_path):
+    data_home = tmp_path / "openpi data"
+    (data_home / "big_vision").mkdir(parents=True)
+    (data_home / "big_vision" / "paligemma_tokenizer.model").write_text("")
+    launcher_env.update(
+        {"OPENPI_DATA_HOME": str(data_home), "OPENPI_CHECKPOINT_BASE_DIR": str(tmp_path / "checkpoints")}
+    )
+    return launcher_env
+
+
+def test_ar3_serve_uses_latest_step_of_newest_run(serve_env, tmp_path):
+    config_dir = tmp_path / "checkpoints" / "pi05_ar3_force_visuotactile_reactive_lowmem"
+    _ar3_checkpoint(config_dir / "old run", 30000)
+    _ar3_checkpoint(config_dir / "new run", 900)
+    expected = _ar3_checkpoint(config_dir / "new run", 10000)
+    # Unfinished saves are skipped.
+    (config_dir / "new run" / "20000.orbax-checkpoint-tmp-3" / "params").mkdir(parents=True)
+    os.utime(config_dir / "old run", (1, 1))
+    os.utime(config_dir / "new run", (2, 2))
+
+    arguments = command_args(run_launcher("serve_ar3_force_visuotactile.sh", serve_env))
+    assert arguments[arguments.index("--checkpoint-dir") + 1] == str(expected)
+    assert arguments[arguments.index("--config-name") + 1] == "pi05_ar3_force_visuotactile_reactive_lowmem"
+    assert arguments[arguments.index("--host") + 1] == "127.0.0.1"
+    assert "OPENPI_AR3_ASSET_ID=ar3_assets" in arguments
+    assert "CUDA_VISIBLE_DEVICES=6" in arguments
+    assert "XLA_PYTHON_CLIENT_PREALLOCATE=false" in arguments
+    assert "--record" not in arguments
+
+    serve_env["OPENPI_EXP_NAME"] = "old run"
+    arguments = command_args(run_launcher("serve_ar3_force_visuotactile.sh", serve_env))
+    assert arguments[arguments.index("--checkpoint-dir") + 1] == str(config_dir / "old run" / "30000")
+
+
+def test_ar3_serve_explicit_checkpoint_on_cpu(serve_env, tmp_path):
+    checkpoint = _ar3_checkpoint(tmp_path / "run", 5)
+    serve_env.update({"OPENPI_SERVE_GPU": "cpu", "OPENPI_PROMPT": "", "OPENPI_PORT": "9000"})
+    arguments = command_args(run_launcher("serve_ar3_force_visuotactile.sh", serve_env, str(checkpoint), "--record"))
+    assert arguments[arguments.index("--checkpoint-dir") + 1] == str(checkpoint)
+    assert arguments[arguments.index("--port") + 1] == "9000"
+    assert "JAX_PLATFORMS=cpu" in arguments
+    assert "--default-prompt" not in arguments
+    assert arguments[-1] == "--record"
+
+
+def test_ar3_serve_requires_a_checkpoint(serve_env, tmp_path):
+    result = run_launcher("serve_ar3_force_visuotactile.sh", serve_env)
+    assert result.returncode != 0
+    assert "No checkpoint found" in result.stderr
+    result = run_launcher("serve_ar3_force_visuotactile.sh", serve_env, str(tmp_path))
+    assert result.returncode != 0
+    assert "not a checkpoint step directory" in result.stderr
