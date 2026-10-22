@@ -208,11 +208,17 @@ requires the active seven-joint position controller, fresh controller/sensor fee
 command ownership. These limits are not collision checking or a guarantee of safe contact. Other private gRPC
 clients cannot be discovered; ensure no other program commands the gripper.
 
+As in replay/preview, the client clips finite gripper predictions to the SDK ranges: position **0..1000**
+and force level **20..100**. This includes LIVE; small endpoint overshoots do not abort a run. Each adjustment
+logs the control step and original/bounded values, while the rollout keeps raw predictions separate from
+acknowledged targets. The worker still rejects invalid commands and rounds valid gripper commands to SDK
+integers. Raw joint targets reach the worker unchanged so its joint-limit and deviation checks remain effective.
+
 By default, LIVE first checks a complete observation through the read-only worker, before loading or warming
 the model. If `--initialize-gripper` is explicitly supplied, this full check is deferred to the LIVE worker
 after initialization; it is not bypassed. No policy action is allowed without valid real inputs.
 The model warms up before the control worker starts. Every observation authorizes one action only;
-expired observations, failed acknowledgements and malformed/out-of-range targets abort the session.
+expired observations, failed acknowledgements and malformed/nonfinite or invalid joint targets abort the session.
 After the first command, a separate watchdog requests a stop if no next command arrives within 0.5 s,
 including while the model/debugger is paused. Stop requests a short arm hold and gripper `Stop`, and checks
 controller hold feedback and the gripper acknowledgement. It does **not** power off the arm or replace a
