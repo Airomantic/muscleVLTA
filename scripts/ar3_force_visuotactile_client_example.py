@@ -5,6 +5,8 @@ Observation sources (--source):
                 compares the predicted actions with the recorded ones: an offline check of a checkpoint over the exact
                 deployment path (WebSocket, transforms, reactive streaming). Needs the openpi environment (uv run).
   fake          FakeAR3Robot: random sensor data, actions are only stored (connection / latency test).
+  ros-readonly  Real ROS/camera/gripper observations with prediction previews only; never sends hardware actions.
+  ros           Real observations and hardware execution, requiring explicit --execute.
   MODULE:CLASS  Your robot driver: a class with the AR3Robot interface below, constructed without arguments, e.g. on
                 top of the ROS 2 topics listed in meta/ar3_capture.json of the dataset.
 
@@ -70,6 +72,7 @@ import dataclasses
 import importlib
 import json
 import logging
+import os
 import pathlib
 import time
 from typing import Any, Protocol
@@ -116,9 +119,9 @@ class AR3Robot(Protocol):
         depth can be sent at full resolution (2, 288, 384); the client downsamples it."""
         ...
 
-    def execute(self, action: np.ndarray) -> None:
+    def execute(self, action: np.ndarray) -> np.ndarray | None:
         """Sends one (9,) action: 7 joint position targets [rad], gripper position (0..1000), force level (20..100).
-        Returns immediately; the control loop keeps the rate."""
+        A driver may return its acknowledged, limited target for logging."""
         ...
 
 
@@ -405,7 +408,11 @@ def run_policy(
             if not pending:
                 raise RuntimeError(f"No action left for step {chunk_step} of chunk {chunk}")
             policy_action = np.asarray(pending.popleft(), np.float32)
-            action = limit_action(policy_action, observation[STATE_KEY], max_joint_step)
+            action = (
+                policy_action.copy()
+                if getattr(robot, "handles_action_limits", False)
+                else limit_action(policy_action, observation[STATE_KEY], max_joint_step)
+            )
             step = Step(
                 index=index,
                 chunk=chunk,
@@ -420,7 +427,12 @@ def run_policy(
                 server_ms=(result or {}).get("server_timing", {}).get("infer_ms"),
                 num_actions=num_actions,
             )
-            robot.execute(action)
+            acknowledged = robot.execute(action)
+            if acknowledged is not None:
+                acknowledged = np.asarray(acknowledged, dtype=np.float32)
+                if acknowledged.shape != (ACTION_DIM,) or not np.isfinite(acknowledged).all():
+                    raise RuntimeError("Robot driver returned an invalid acknowledged action.")
+                step.action = acknowledged
             for callback in callbacks:
                 callback(step)
             index += 1
@@ -593,7 +605,12 @@ class RerunLogger:
     """
 
     def __init__(
-        self, target: str, *, application_id: str = "ar3_force_visuotactile_inference", jpeg_quality: int = 85
+        self,
+        target: str,
+        *,
+        application_id: str = "ar3_force_visuotactile_inference",
+        jpeg_quality: int = 85,
+        read_only: bool = False,
     ):
         import rerun as rr
         import rerun.blueprint as rrb
@@ -601,7 +618,7 @@ class RerunLogger:
         self._rr = rr
         self._jpeg_quality = jpeg_quality
         self._recording = rr.RecordingStream(application_id)
-        blueprint = self.blueprint(rrb)
+        blueprint = self.blueprint(rrb, read_only=read_only)
         if target == "spawn":
             self._recording.spawn(default_blueprint=blueprint)
         elif "://" in target:
@@ -611,9 +628,13 @@ class RerunLogger:
             path.parent.mkdir(parents=True, exist_ok=True)
             self._recording.save(path, default_blueprint=blueprint)
         self._log_styles()
+        if read_only:
+            self._recording.log(
+                "inference_log", rr.TextLog("READ-ONLY: real observations; predictions are NOT sent to hardware.")
+            )
 
     @staticmethod
-    def blueprint(rrb):
+    def blueprint(rrb, *, read_only: bool = False):
         def series(origin: str, name: str):
             return rrb.TimeSeriesView(origin=origin, name=name)
 
@@ -632,14 +653,14 @@ class RerunLogger:
                 for s in TACTILE_SENSORS
             ),
             grid_columns=4,
-            name="episode",
+            name="live observations (read-only)" if read_only else "episode",
         )
         compare = rrb.Grid(
             *(series(f"compare/{name}", f"{name} [rad]") for name in JOINT_NAMES),
             series("inference", "inference round trip / server [ms]"),
             rrb.TextLogView(origin="inference_log", name="server calls"),
             grid_columns=3,
-            name="policy vs recorded",
+            name="predictions vs measured state" if read_only else "policy vs recorded",
         )
         return rrb.Blueprint(rrb.Tabs(episode, compare))
 
@@ -654,6 +675,7 @@ class RerunLogger:
             "gripper/actual": rr.SeriesLines(names="actual", colors=STATE_COLOR),
             "gripper/policy": rr.SeriesLines(names="policy", colors=POLICY_COLOR),
             "gripper_force_level/command": rr.SeriesLines(names="command (recorded)", colors=RECORDED_COLOR),
+            "gripper_force_level/input_setting": rr.SeriesLines(names="input force setting", colors=STATE_COLOR),
             "gripper_force_level/policy": rr.SeriesLines(names="policy", colors=POLICY_COLOR),
             "inference/round_trip_ms": rr.SeriesLines(names="round trip"),
             "inference/server_ms": rr.SeriesLines(names="server"),
@@ -688,6 +710,8 @@ class RerunLogger:
         scalars("gripper/actual", state[GRIPPER_INDEX])
         scalars("gripper/policy", policy[GRIPPER_INDEX])
         scalars("gripper_force_level/policy", policy[FORCE_LEVEL_INDEX])
+        if FORCE_LEVEL_KEY in observation:
+            scalars("gripper_force_level/input_setting", observation[FORCE_LEVEL_KEY])
         for index, name in enumerate(JOINT_NAMES):
             scalars(f"compare/{name}/policy", policy[index])
             scalars(f"compare/{name}/state", state[index])
@@ -729,6 +753,64 @@ class RerunLogger:
 def make_robot(args: argparse.Namespace, metadata: dict) -> AR3Robot:
     if args.source == "fake":
         return FakeAR3Robot()
+    if args.source in ("ros-readonly", "ros"):
+        from openpi_client.ar3_ros_control import LiveAR3Robot
+        from openpi_client.ar3_ros_readonly import ReadOnlyAR3Robot
+
+        live = args.source == "ros"
+        validate_execution_args(args)
+        worker_args = [
+            "--front-topic",
+            args.front_topic,
+            "--wrist-topic",
+            args.wrist_topic,
+            "--joint-topic",
+            args.joint_topic,
+            "--tactile-prefix",
+            args.tactile_prefix,
+            "--gripper-address",
+            args.gripper_address,
+            "--force-level",
+            str(args.force_level),
+            "--max-age",
+            str(args.observation_max_age),
+            "--timeout",
+            str(args.observation_timeout),
+        ]
+        if live:
+            worker_args += [
+                "--execute",
+                "--joint-command-topic",
+                args.joint_command_topic,
+                "--controller-name",
+                args.controller_name,
+                "--command-period",
+                str(1.0 / args.fps),
+                "--max-joint-step",
+                str(args.max_joint_step),
+                "--max-joint-velocity",
+                str(args.max_joint_velocity),
+                "--max-target-deviation",
+                str(args.max_target_deviation),
+                "--command-timeout",
+                str(args.command_timeout),
+                "--gripper-speed",
+                str(args.gripper_speed),
+            ]
+            if args.initialize_gripper:
+                worker_args.append("--initialize-gripper")
+        robot_class = LiveAR3Robot if live else ReadOnlyAR3Robot
+        return robot_class(
+            worker_script=pathlib.Path(__file__).with_name(
+                "ar3_ros_control_worker.py" if live else "ar3_ros_observation_worker.py"
+            ),
+            ros_python=args.ros_python,
+            ros_setup=args.ros_setup,
+            domain_id=args.ros_domain_id,
+            timeout=args.observation_timeout + 5,
+            startup_timeout=60 if live else None,
+            worker_args=worker_args,
+        )
     if args.source == "dataset":
         if not args.dataset:
             raise ValueError("--source dataset needs --dataset (LeRobot v3.0 dataset directory)")
@@ -742,15 +824,15 @@ def make_robot(args: argparse.Namespace, metadata: dict) -> AR3Robot:
         )
     module_name, _, class_name = args.source.partition(":")
     if not module_name or not class_name:
-        raise ValueError(f"Unknown --source {args.source!r}: use fake, dataset or MODULE:CLASS")
+        raise ValueError(f"Unknown --source {args.source!r}: use fake, dataset, ros-readonly, ros or MODULE:CLASS")
     return getattr(importlib.import_module(module_name), class_name)()
 
 
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--source", default="fake", help="fake | dataset | MODULE:CLASS (robot driver)")
+    parser.add_argument("--source", default="fake", help="fake | dataset | ros-readonly | ros | MODULE:CLASS")
     parser.add_argument("--mode", choices=("auto", "chunk", "reactive"), default="auto")
     parser.add_argument("--prompt", default=None, help="task prompt (default: episode task for dataset replay)")
     parser.add_argument(
@@ -772,15 +854,69 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     replay.add_argument("--start-frame", type=int, default=0)
     replay.add_argument("--allow-missing-videos", action="store_true", help="black frames for missing videos")
     replay.add_argument("--tactile-cache-dir", default=None, help="tactile cache (default: same as training)")
+    ros = parser.add_argument_group("real ROS observations (--source ros-readonly or ros)")
+    ros.add_argument(
+        "--ros-python",
+        default=str(pathlib.Path(__file__).resolve().parents[2] / "V3_Gripper/.venv-ros/bin/python"),
+        help="separate Python 3.12 interpreter with ROS Jazzy and the gripper gRPC client",
+    )
+    ros.add_argument("--ros-setup", default="/opt/ros/jazzy/setup.bash")
+    ros.add_argument("--ros-domain-id", type=int, default=int(os.environ.get("ROS_DOMAIN_ID", "111")))
+    ros.add_argument("--front-topic", default="/front/color/image_raw")
+    ros.add_argument("--wrist-topic", default="/wrist/color/image_raw")
+    ros.add_argument("--joint-topic", default="/joint_states")
+    ros.add_argument("--tactile-prefix", default="/v3_gripper/tactile")
+    ros.add_argument("--gripper-address", default="192.168.127.10:50008")
+    ros.add_argument("--force-level", type=float, default=80.0, help="known commanded SDK setting, NOT measured force")
+    ros.add_argument("--observation-max-age", type=float, default=0.5, help="reject stale sensor data [s]")
+    ros.add_argument("--observation-timeout", type=float, default=10.0, help="wait for fresh observations [s]")
+    control = parser.add_argument_group("hardware actions (--source ros --execute only)")
+    control.add_argument("--execute", action="store_true", help="explicitly allow physical arm/gripper actions")
+    control.add_argument(
+        "--initialize-gripper", action="store_true", help="allow motor initialization if needed; may move"
+    )
+    control.add_argument("--joint-command-topic", default="/position_joint_trajectory_controller/joint_trajectory")
+    control.add_argument("--controller-name", default="position_joint_trajectory_controller")
+    control.add_argument("--max-joint-velocity", type=float, default=0.2, help="conservative joint speed cap [rad/s]")
+    control.add_argument(
+        "--max-target-deviation", type=float, default=0.25, help="reject larger model/state gaps [rad]"
+    )
+    control.add_argument("--command-timeout", type=float, default=0.5, help="independent worker watchdog deadline [s]")
+    control.add_argument("--gripper-speed", type=int, default=20, help="SDK speed setting [1..100]")
     outputs = parser.add_argument_group("outputs")
     outputs.add_argument("--output-dir", default=None, help="write rollout.npz and summary.json")
     outputs.add_argument("--rerun", default=None, help="spawn | FILE.rrd | rerun+http://HOST:9876/proxy")
-    return parser.parse_args(argv)
+    return parser
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
-    args = parse_args(argv)
-    client = websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
+    return run(parse_args(argv))
+
+
+def validate_execution_args(args: argparse.Namespace) -> None:
+    live = args.source == "ros"
+    if live != args.execute:
+        raise ValueError(
+            "Hardware execution requires both --source ros and --execute; readonly/fake/replay cannot execute."
+        )
+    if args.initialize_gripper and not live:
+        raise ValueError("--initialize-gripper requires --source ros --execute.")
+    if live:
+        for name in ("fps", "max_joint_step", "max_joint_velocity", "max_target_deviation", "command_timeout"):
+            value = getattr(args, name)
+            if value is None or not np.isfinite(value) or value <= 0:
+                raise ValueError(f"Live execution requires positive finite --{name.replace('_', '-')}.")
+        if not 1 <= args.gripper_speed <= 100:
+            raise ValueError("--gripper-speed must be in 1..100.")
+
+
+def run(args: argparse.Namespace, *, policy_client=None) -> dict[str, Any]:
+    validate_execution_args(args)
+    client = policy_client or websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
     metadata = client.get_server_metadata()
     logging.info("Server metadata: %s", metadata)
     if "action_horizon" not in metadata:
@@ -797,7 +933,25 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     if not 0 <= args.execute_steps <= action_horizon:
         raise ValueError(f"--execute-steps must be in [0, {action_horizon}], got {args.execute_steps}")
 
+    prompt = args.prompt or PROMPT
+    if args.source == "ros":
+        logging.warning("Warming the policy on synthetic observations BEFORE creating the hardware control worker.")
+        run_policy(
+            client,
+            FakeAR3Robot(),
+            mode=mode,
+            action_horizon=action_horizon,
+            prompt=prompt,
+            tactile_shape=metadata.get("tactile_shape"),
+            reactive_k=reactive_k,
+            execute_steps=args.execute_steps,
+            num_chunks=1,
+            fps=0,
+        )
     robot = make_robot(args, metadata)
+    read_only = bool(getattr(robot, "read_only", False))
+    if read_only:
+        logging.warning("READ-ONLY preview: predicted actions will not be sent to the arm or gripper.")
     prompt = args.prompt or getattr(robot, "task", None) or PROMPT
     fps = args.fps if args.fps is not None else (0.0 if args.source == "dataset" else 15.0)
     episode = getattr(robot, "episode", None)
@@ -815,7 +969,9 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     try:
         if args.rerun:
             application_id = "ar3_force_visuotactile_inference" + (f"/episode_{episode}" if episode is not None else "")
-            viewer = RerunLogger(args.rerun, application_id=application_id)
+            if read_only:
+                application_id += "/read_only"
+            viewer = RerunLogger(args.rerun, application_id=application_id, read_only=read_only)
             callbacks.append(viewer)
         run_policy(
             client,
@@ -845,6 +1001,7 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
         "mode": mode,
         "reactive_k": reactive_k if mode == "reactive" else None,
         "source": args.source,
+        "read_only": read_only,
         "dataset": args.dataset if args.source == "dataset" else None,
         "episode": episode,
         "prompt": prompt,
