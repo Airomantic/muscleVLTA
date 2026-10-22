@@ -26,11 +26,11 @@ EXP_NAME="${OPENPI_EXP_NAME:-ar3_mot_$(date +%Y%m%d_%H%M)}"
 GPUS="${OPENPI_CUDA_VISIBLE_DEVICES:-6,7}"
 NUM_GPUS="$(awk -F, '{print NF}' <<<"${GPUS}")"
 BATCH_SIZE="${OPENPI_BATCH_SIZE:-32}"
-NUM_TRAIN_STEPS="${OPENPI_NUM_TRAIN_STEPS:-30000}"
+NUM_TRAIN_STEPS="${OPENPI_NUM_TRAIN_STEPS:-300000}"
 NUM_WORKERS="${OPENPI_NUM_WORKERS:-8}"
 PYTHON="${OPENPI_PYTHON:-${REPO_ROOT}/.venv/bin/python}"
 
-export OPENPI_AR3_REPO_ID="${OPENPI_AR3_REPO_ID:-/data/jiang/utilData/ar3_force_computeChargingPullOut_force_aware}"
+export OPENPI_AR3_REPO_ID="${OPENPI_AR3_REPO_ID:-/data/jiang/ar3_force_computeChargingPullOut_force_aware}"
 export OPENPI_AR3_ASSET_ID="${OPENPI_AR3_ASSET_ID:-$(basename "${OPENPI_AR3_REPO_ID}")}"
 export OPENPI_AR3_WEIGHT_PATH="${OPENPI_AR3_WEIGHT_PATH:-/data/jiang/checkpoints/openpi-assets/checkpoints/pi05_base/params}"
 # paligemma_tokenizer.model is read from ${OPENPI_DATA_HOME}/big_vision/.
