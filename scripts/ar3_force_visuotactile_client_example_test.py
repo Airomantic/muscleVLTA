@@ -1,5 +1,7 @@
 import json
+import logging
 import pathlib
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -10,6 +12,7 @@ from openpi.data import lerobot_v3
 from openpi.policies import ar3_force_visuotactile_policy as ar3
 from openpi.serving import websocket_policy_server
 from scripts import ar3_force_visuotactile_client_example as client_example
+from scripts.ar3_action_limits import JointLimits
 
 DATASET = pathlib.Path(__file__).resolve().parents[1] / "dataset_example"
 TACTILE_SHAPE = (72, 96)
@@ -88,6 +91,90 @@ def test_client_layout_matches_policy_transforms():
     assert ar3.ACTION_NAMES[client_example.GRIPPER_INDEX] == "gripper.position_sdk"
 
 
+def test_readonly_source_uses_real_worker_without_motion_api(monkeypatch):
+    from openpi_client import ar3_ros_readonly
+
+    requested = {}
+    expected = object()
+
+    def create_worker(**kwargs):
+        requested.update(kwargs)
+        return expected
+
+    monkeypatch.setattr(ar3_ros_readonly, "ReadOnlyAR3Robot", create_worker)
+    args = client_example.parse_args(["--source", "ros-readonly", "--force-level", "75", "--ros-domain-id", "112"])
+    assert client_example.make_robot(args, {}) is expected
+    assert requested["worker_script"].name == "ar3_ros_observation_worker.py"
+    assert requested["domain_id"] == 112
+    assert requested["worker_args"][requested["worker_args"].index("--force-level") + 1] == "75.0"
+    assert "--execute" not in requested["worker_args"]
+
+
+def test_live_source_threads_explicit_limits_and_initialization_to_worker(monkeypatch):
+    from openpi_client import ar3_ros_control
+
+    requested = {}
+    monkeypatch.setattr(ar3_ros_control, "LiveAR3Robot", lambda **kwargs: requested.update(kwargs))
+    args = client_example.parse_args(
+        ["--source", "ros", "--execute", "--fps", "15", "--initialize-gripper", "--max-joint-velocity", "0.1"]
+    )
+    client_example.make_robot(args, {})
+    assert requested["worker_script"].name == "ar3_ros_control_worker.py"
+    assert "--execute" in requested["worker_args"]
+    assert "--initialize-gripper" in requested["worker_args"]
+    assert requested["worker_args"][requested["worker_args"].index("--max-joint-velocity") + 1] == "0.1"
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--source", "ros"],
+        ["--source", "ros-readonly", "--execute"],
+        ["--source", "ros", "--execute", "--fps", "100"],
+        ["--source", "ros", "--execute", "--fps", "15", "--command-timeout", "0.05"],
+        ["--source", "ros", "--execute", "--fps", "15", "--command-timeout", "3"],
+    ],
+)
+def test_live_invalid_opt_in_or_deadlines_fail_before_policy_or_worker(options):
+    with pytest.raises(ValueError, match="Hardware execution|Live execution|--command-timeout"):
+        client_example.run(client_example.parse_args(options))
+
+
+def test_live_warms_whole_chunk_before_worker_and_uses_explicit_prompt(monkeypatch, caplog):
+    policy = FakeReactivePolicy(action_horizon=4)
+    client = InProcessClient(policy, {"action_horizon": 4, "reactive": True, "cross_attention_latency": 1})
+    events, actions = [], []
+
+    class Robot(client_example.FakeAR3Robot):
+        handles_action_limits = True
+
+        def execute(self, target):
+            actions.append(target.copy())
+            return super().execute(target)
+
+        def close(self):
+            events.append("close")
+
+    def create_robot(args, metadata):
+        assert len(policy.replans) == 1
+        assert [step for step, _, _ in policy.calls] == [0, 2]
+        events.append("create")
+        return Robot()
+
+    monkeypatch.setattr(client_example, "make_robot", create_robot)
+    monkeypatch.setattr(client_example.time, "sleep", lambda seconds: None)
+    args = client_example.parse_args(
+        ["--source", "ros", "--execute", "--fps", "15", "--max-steps", "3", "--prompt", "a different task"]
+    )
+    with caplog.at_level(logging.INFO):
+        summary = client_example.run(args, policy_client=client)
+    assert summary["prompt"] == "a different task"
+    assert all(observation["prompt"] == "a different task" for observation in policy.replans)
+    assert len(actions) == 3
+    assert events == ["create", "close"]
+    assert "Control step budget reached (--max-steps=3); requesting normal shutdown." in caplog.text
+
+
 def test_prepare_observation_downsamples_tactile_like_training():
     depth = np.random.default_rng(0).random((2, 288, 384), dtype=np.float32) * 1.4
     observation = client_example.prepare_observation(
@@ -119,6 +206,86 @@ def test_limit_action_clips_joint_steps_and_gripper_ranges():
     np.testing.assert_allclose(unlimited[:7], action[:7])
     np.testing.assert_allclose(unlimited[7:], [1000.0, 20.0])
     assert action[7] == 1200.0  # not modified in place
+
+
+@pytest.mark.parametrize("mode", ["chunk", "reactive"])
+def test_live_gripper_predictions_are_bounded_without_hiding_raw_joints(mode, caplog):
+    predictions = np.asarray(
+        [
+            [0.08] * 7 + [-0.25, 19.75],
+            [0.08] * 7 + [1000.25, 100.25],
+            [0.08] * 7 + [400.25, 79.75],
+            [0.08] * 7 + [0, 100],
+        ],
+        dtype=np.float32,
+    )
+    original = predictions.copy()
+    requested = []
+    limits = JointLimits(-np.ones(7), np.ones(7), np.ones(7))
+
+    class Client:
+        def infer(self, observation):
+            return {"actions": predictions}
+
+        def reactive_replan(self, observation, *, k):
+            self.next_step = k
+            return {"actions": predictions[:k]}
+
+        def reactive_step(self, readings, *, k):
+            start = self.next_step
+            self.next_step += k
+            return {"start_step": start, "actions": predictions[start : self.next_step]}
+
+    class Robot(client_example.FakeAR3Robot):
+        handles_action_limits = True
+
+        def execute(self, target):
+            requested.append(target.copy())
+            applied = limits.bound_action(
+                target, self.joints, period=1 / 15, max_step=0.03, max_velocity=0.1, max_deviation=0.25
+            )
+            super().execute(applied)
+            return applied
+
+    recorder = client_example.EpisodeRecorder()
+    with caplog.at_level(logging.WARNING):
+        steps = client_example.run_policy(
+            Client(),
+            Robot(),
+            mode=mode,
+            action_horizon=4,
+            prompt="test prompt",
+            reactive_k=2,
+            num_chunks=2,
+            max_joint_step=0.001,
+            callbacks=[recorder],
+        )
+
+    assert steps == 8
+    data = recorder.arrays()
+    expected_raw = np.tile(original, (2, 1))
+    np.testing.assert_array_equal(predictions, original)
+    np.testing.assert_array_equal(data["policy_action"], expected_raw)
+    np.testing.assert_array_equal(np.asarray(requested)[:, :7], expected_raw[:, :7])
+    np.testing.assert_array_equal(data["action"][:, 7:], np.tile([[0, 20], [1000, 100], [400, 80], [0, 100]], (2, 1)))
+    np.testing.assert_allclose(data["action"][0, :7], 0.1 / 15)
+    assert "position -0.25 -> 0" in caplog.text
+    assert "position 1000.25 -> 1000" in caplog.text
+    assert "force level 19.75 -> 20" in caplog.text
+    assert "force level 100.25 -> 100" in caplog.text
+    assert len([record for record in caplog.records if "clipped gripper targets" in record.message]) == 4
+
+
+@pytest.mark.parametrize(("index", "value"), [(7, np.nan), (7, -np.inf), (8, np.inf)])
+def test_nonfinite_gripper_predictions_fail_before_saturation_or_execution(monkeypatch, index, value):
+    predictions = np.asarray([[0.0] * 7 + [500, 80]], dtype=np.float32)
+    predictions[0, index] = value
+    robot = client_example.FakeAR3Robot()
+    robot.handles_action_limits = True
+    monkeypatch.setattr(robot, "execute", lambda target: pytest.fail("Invalid predictions must never be executed"))
+    client = SimpleNamespace(infer=lambda observation: {"actions": predictions})
+    with pytest.raises(ValueError, match="non-finite actions"):
+        client_example.run_policy(client, robot, mode="chunk", action_horizon=1, prompt="test", max_steps=1)
 
 
 def test_chunk_mode_executes_the_first_actions_of_each_chunk():
