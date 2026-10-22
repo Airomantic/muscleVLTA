@@ -362,11 +362,7 @@ class SubscriptionOnlyNodeMixin:
         raise RuntimeError("ROS services are forbidden in the read-only observation worker")
 
 
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument(
-        "--check-gripper", action="store_true", help="Check real motor feedback via GetAllState only, then exit"
-    )
+def add_observation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--front-topic", default="/front/color/image_raw")
     parser.add_argument("--wrist-topic", default="/wrist/color/image_raw")
     parser.add_argument("--joint-topic", default="/joint_states")
@@ -378,7 +374,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-age", type=float, default=0.5, help="Maximum input age and timestamp spread, seconds")
     parser.add_argument("--timeout", type=float, default=10, help="Deadline per observation request, seconds")
     parser.add_argument("--joint-names", nargs=7, default=JOINT_NAMES)
-    args = parser.parse_args(argv)
+
+
+def validate_observation_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if not math.isfinite(args.force_level) or not 20 <= args.force_level <= 100:
         parser.error("--force-level must be finite and in 20..100")
     for name in ("max_age", "timeout"):
@@ -391,10 +389,50 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         for name in ("front_topic", "wrist_topic", "joint_topic", "tactile_prefix", "gripper_address")
     ):
         parser.error("Topics, tactile prefix, and gripper address must not be empty")
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_observation_arguments(parser)
+    parser.add_argument(
+        "--check-gripper", action="store_true", help="Check real motor feedback via GetAllState only, then exit"
+    )
+    args = parser.parse_args(argv)
+    validate_observation_arguments(parser, args)
     return args
 
 
-def _reserve_protocol_stdout() -> BinaryIO:
+def subscribe_observations(node: Any, args: argparse.Namespace, samples: dict[str, Sample]) -> None:
+    from geometry_msgs.msg import WrenchStamped
+    from rclpy.qos import HistoryPolicy
+    from rclpy.qos import QoSProfile
+    from rclpy.qos import ReliabilityPolicy
+    from sensor_msgs.msg import Image
+    from sensor_msgs.msg import JointState
+
+    qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+    topics = [
+        ("joints", JointState, args.joint_topic),
+        ("front", Image, args.front_topic),
+        ("wrist", Image, args.wrist_topic),
+    ]
+    prefix = args.tactile_prefix.rstrip("/")
+    for sensor in (0, 2):
+        topics.extend(
+            (
+                (f"depth_{sensor}", Image, f"{prefix}/sensor_{sensor}/depth"),
+                (f"wrench_{sensor}", WrenchStamped, f"{prefix}/sensor_{sensor}/wrench"),
+            )
+        )
+    for key, msg_type, topic in topics:
+
+        def receive(message: Any, key: str = key) -> None:
+            samples[key] = Sample(message, time.monotonic())
+
+        node.create_subscription(msg_type, topic, receive, qos)
+
+
+def reserve_protocol_stdout() -> BinaryIO:
     sys.stdout.flush()
     output = os.fdopen(os.dup(sys.stdout.fileno()), "wb")
     # Redirect native-library output as well as Python prints away from the protocol.
@@ -405,7 +443,7 @@ def _reserve_protocol_stdout() -> BinaryIO:
 def main(argv: Sequence[str] | None = None) -> int:
     os.environ["RCUTILS_LOGGING_USE_STDOUT"] = "0"
     args = parse_args(argv)
-    output = None if args.check_gripper else _reserve_protocol_stdout()
+    output = None if args.check_gripper else reserve_protocol_stdout()
     context = node = executor = channel = None
     try:
         from DM_V3Gripper import gripper_pb2
@@ -427,17 +465,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 0
 
-        from geometry_msgs.msg import WrenchStamped
         import rclpy
         from rclpy.context import Context
         from rclpy.executors import SingleThreadedExecutor
         from rclpy.node import Node
         from rclpy.parameter import Parameter
-        from rclpy.qos import HistoryPolicy
-        from rclpy.qos import QoSProfile
-        from rclpy.qos import ReliabilityPolicy
-        from sensor_msgs.msg import Image
-        from sensor_msgs.msg import JointState
 
         class ObservationNode(SubscriptionOnlyNodeMixin, Node):
             pass
@@ -455,27 +487,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         executor = SingleThreadedExecutor(context=context)
         executor.add_node(node)
-        qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
         samples: dict[str, Sample] = {}
-        topics = [
-            ("joints", JointState, args.joint_topic),
-            ("front", Image, args.front_topic),
-            ("wrist", Image, args.wrist_topic),
-        ]
-        prefix = args.tactile_prefix.rstrip("/")
-        for sensor in (0, 2):
-            topics.extend(
-                (
-                    (f"depth_{sensor}", Image, f"{prefix}/sensor_{sensor}/depth"),
-                    (f"wrench_{sensor}", WrenchStamped, f"{prefix}/sensor_{sensor}/wrench"),
-                )
-            )
-        for key, msg_type, topic in topics:
-
-            def receive(message: Any, key: str = key) -> None:
-                samples[key] = Sample(message, time.monotonic())
-
-            node.create_subscription(msg_type, topic, receive, qos)
+        subscribe_observations(node, args, samples)
         channel = grpc.insecure_channel(args.gripper_address, options=(("grpc.enable_http_proxy", 0),))
         get_state = bind_gripper_reader(channel, gripper_pb2.StateResponse)
         print(

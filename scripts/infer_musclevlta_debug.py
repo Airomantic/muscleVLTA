@@ -1,5 +1,6 @@
 """Local-model debug: read-only by default; --source ros --execute enables physical actions."""
 
+import copy
 import logging
 import os
 from pathlib import Path
@@ -39,7 +40,11 @@ class LocalPolicyClient:
 
 def check_readonly_observations(args):
     logging.info("Checking real ROS observations before loading the model; no hardware commands will be sent.")
-    robot = client_example.make_robot(args, {})
+    readonly_args = copy.copy(args)
+    readonly_args.source = "ros-readonly"
+    readonly_args.execute = False
+    readonly_args.initialize_gripper = False
+    robot = client_example.make_robot(readonly_args, {})
     try:
         observation = robot.observe()
     finally:
@@ -73,16 +78,29 @@ def main(argv=None):
         client_example.validate_execution_args(args)
     except ValueError as exc:
         parser.error(str(exc))
+    if args.execute:
+        for path in (
+            Path(__file__).with_name("ar3_ros_control_worker.py"),
+            Path(args.ros_python),
+            Path(args.ros_setup),
+        ):
+            if not path.is_file():
+                parser.error(f"Missing live control prerequisite: {path}")
 
     logging.warning(
         "LIVE DEBUG: the arm and gripper WILL MOVE; keep the emergency stop accessible."
         if args.execute
         else "READ-ONLY DEBUG: no arm/gripper actions or initialization are sent."
     )
-    if args.source == "ros-readonly":
+    if args.initialize_gripper:
+        logging.info(
+            "Full observation preflight is deferred to the LIVE worker because motor initialization was explicitly "
+            "requested; valid observations will still be required before any policy action."
+        )
+    else:
         check_readonly_observations(args)
-        if args.check_observations:
-            return None
+    if args.check_observations:
+        return None
 
     # Configure JAX before importing the model stack.
     os.environ["CUDA_VISIBLE_DEVICES"] = "" if args.gpu == "cpu" else args.gpu

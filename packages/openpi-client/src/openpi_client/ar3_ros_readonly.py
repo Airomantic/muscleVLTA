@@ -18,6 +18,17 @@ logger = logging.getLogger(__name__)
 MAX_FRAME_BYTES = 64 * 1024 * 1024
 
 
+def frame_flag(frame: dict[str, np.ndarray], key: str) -> bool:
+    value = frame.get(key)
+    return value is not None and value.shape == () and value.dtype == np.bool_ and bool(value.item())
+
+
+class ROSWorkerError(RuntimeError):
+    def __init__(self, message: str, *, stopped: bool = False):
+        super().__init__(f"ROS observation worker: {message}")
+        self.stopped = stopped
+
+
 class ReadOnlyAR3Robot:
     """Read real observations in a separate Python/ROS environment; discard proposed actions."""
 
@@ -95,7 +106,7 @@ class ReadOnlyAR3Robot:
             logger.warning("LIVE EXECUTION: model actions will be sent to the arm and gripper.")
 
     def _validate_handshake(self, handshake: dict[str, np.ndarray]) -> None:
-        if not bool(handshake.get("__ready__", np.array(False)).item()):
+        if not frame_flag(handshake, "__ready__"):
             raise RuntimeError("ROS worker did not return its readiness handshake.")
 
     def _read_exact(self, size: int, deadline: float) -> bytes:
@@ -119,7 +130,7 @@ class ReadOnlyAR3Robot:
         with np.load(io.BytesIO(self._read_exact(size, deadline)), allow_pickle=False) as archive:
             result = {key: archive[key] for key in archive.files}
         if "__error__" in result:
-            raise RuntimeError(f"ROS observation worker: {result['__error__'].item()}")
+            raise ROSWorkerError(str(result["__error__"].item()), stopped=frame_flag(result, "__stopped__"))
         return result
 
     def _send(self, operation: str, **fields) -> None:

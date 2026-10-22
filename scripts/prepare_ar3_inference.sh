@@ -379,7 +379,7 @@ run_task() {
             if ((WITH_TILT)); then
                 wait_topic /camera_tilt/state_deg std_msgs/msg/Float64 --field data \
                     --qos-reliability reliable --qos-durability transient_local \
-                    --filter "abs(m.data - $TILT_ANGLE) <= 2.0"
+                    --filter "abs(m - $TILT_ANGLE) <= 2.0"
             fi
             gripper_feedback_ready
             if ((WITH_POLICY)); then

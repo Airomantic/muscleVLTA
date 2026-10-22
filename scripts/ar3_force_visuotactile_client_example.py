@@ -570,7 +570,7 @@ def format_summary(summary: dict[str, Any]) -> str:
             f"p95 {stats['p95']:.1f} ms, max {stats['max']:.1f} ms{server}"
         )
     if summary.get("limited_steps"):
-        lines.append(f"  joint targets limited by --max-joint-step in {summary['limited_steps']} steps")
+        lines.append(f"  joint targets adjusted before execution in {summary['limited_steps']} steps (not stop events)")
     evaluation = summary.get("evaluation")
     if evaluation and evaluation["frames"]:
         per_joint = " ".join(f"{value:.2f}" for value in evaluation["joint_mae_deg"].values())
@@ -754,9 +754,6 @@ def make_robot(args: argparse.Namespace, metadata: dict) -> AR3Robot:
     if args.source == "fake":
         return FakeAR3Robot()
     if args.source in ("ros-readonly", "ros"):
-        from openpi_client.ar3_ros_control import LiveAR3Robot
-        from openpi_client.ar3_ros_readonly import ReadOnlyAR3Robot
-
         live = args.source == "ros"
         validate_execution_args(args)
         worker_args = [
@@ -799,7 +796,14 @@ def make_robot(args: argparse.Namespace, metadata: dict) -> AR3Robot:
             ]
             if args.initialize_gripper:
                 worker_args.append("--initialize-gripper")
-        robot_class = LiveAR3Robot if live else ReadOnlyAR3Robot
+        if live:
+            from openpi_client.ar3_ros_control import LiveAR3Robot
+
+            robot_class = LiveAR3Robot
+        else:
+            from openpi_client.ar3_ros_readonly import ReadOnlyAR3Robot
+
+            robot_class = ReadOnlyAR3Robot
         return robot_class(
             worker_script=pathlib.Path(__file__).with_name(
                 "ar3_ros_control_worker.py" if live else "ar3_ros_observation_worker.py"
@@ -808,7 +812,7 @@ def make_robot(args: argparse.Namespace, metadata: dict) -> AR3Robot:
             ros_setup=args.ros_setup,
             domain_id=args.ros_domain_id,
             timeout=args.observation_timeout + 5,
-            startup_timeout=60 if live else None,
+            startup_timeout=max(60, 3 * args.observation_timeout + 20) if live else None,
             worker_args=worker_args,
         )
     if args.source == "dataset":
@@ -910,6 +914,10 @@ def validate_execution_args(args: argparse.Namespace) -> None:
             value = getattr(args, name)
             if value is None or not np.isfinite(value) or value <= 0:
                 raise ValueError(f"Live execution requires positive finite --{name.replace('_', '-')}.")
+        if not 5 <= args.fps <= 50:
+            raise ValueError("Live execution requires --fps in 5..50 for short bounded trajectories.")
+        if not 1 / args.fps < args.command_timeout <= 2:
+            raise ValueError("--command-timeout must exceed one control period and be <= 2 seconds.")
         if not 1 <= args.gripper_speed <= 100:
             raise ValueError("--gripper-speed must be in 1..100.")
 
@@ -973,7 +981,7 @@ def run(args: argparse.Namespace, *, policy_client=None) -> dict[str, Any]:
                 application_id += "/read_only"
             viewer = RerunLogger(args.rerun, application_id=application_id, read_only=read_only)
             callbacks.append(viewer)
-        run_policy(
+        steps = run_policy(
             client,
             robot,
             mode=mode,
@@ -988,13 +996,17 @@ def run(args: argparse.Namespace, *, policy_client=None) -> dict[str, Any]:
             max_joint_step=args.max_joint_step,
             callbacks=callbacks,
         )
+        if args.max_steps > 0 and steps >= args.max_steps:
+            logging.info("Control step budget reached (--max-steps=%d); requesting normal shutdown.", args.max_steps)
     except KeyboardInterrupt:
         logging.info("Stopped.")
     finally:
-        if callable(close := getattr(robot, "close", None)):
-            close()
-        if viewer is not None:
-            viewer.close()
+        try:
+            if callable(close := getattr(robot, "close", None)):
+                close()
+        finally:
+            if viewer is not None:
+                viewer.close()
 
     summary = {
         "config_name": metadata.get("config_name"),
