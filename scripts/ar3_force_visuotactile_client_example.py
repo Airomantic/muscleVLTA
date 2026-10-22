@@ -408,11 +408,21 @@ def run_policy(
             if not pending:
                 raise RuntimeError(f"No action left for step {chunk_step} of chunk {chunk}")
             policy_action = np.asarray(pending.popleft(), np.float32)
-            action = (
-                policy_action.copy()
-                if getattr(robot, "handles_action_limits", False)
-                else limit_action(policy_action, observation[STATE_KEY], max_joint_step)
+            action = limit_action(
+                policy_action,
+                observation[STATE_KEY],
+                max_joint_step=0.0 if getattr(robot, "handles_action_limits", False) else max_joint_step,
             )
+            if np.any(action[GRIPPER_INDEX:] != policy_action[GRIPPER_INDEX:]):
+                logging.warning(
+                    "Control step %d: clipped gripper targets to SDK ranges: position %.6g -> %.6g (0..1000), "
+                    "force level %.6g -> %.6g (20..100).",
+                    index,
+                    policy_action[GRIPPER_INDEX],
+                    action[GRIPPER_INDEX],
+                    policy_action[FORCE_LEVEL_INDEX],
+                    action[FORCE_LEVEL_INDEX],
+                )
             step = Step(
                 index=index,
                 chunk=chunk,

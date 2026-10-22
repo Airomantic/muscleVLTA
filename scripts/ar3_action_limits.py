@@ -69,7 +69,10 @@ class JointLimits:
         if np.any(np.abs(target[:7] - measured) > max_deviation):
             raise ValueError("Model target is too far from measured joints; check state, units and checkpoint.")
         if not 0 <= target[7] <= 1000 or not 20 <= target[8] <= 100:
-            raise ValueError("Gripper target must be position 0..1000 and force level 20..100.")
+            raise ValueError(
+                "Gripper target must be position 0..1000 and force level 20..100; "
+                f"received position={target[7]:g}, force level={target[8]:g}."
+            )
         velocity = np.minimum(self.velocity, max_velocity)
         delta = np.minimum(max_step, velocity * period)
         low, high = measured - delta, measured + delta
