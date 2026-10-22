@@ -121,6 +121,112 @@ See the script headers for overrides (dataset, weights, GPUs, batch size, resume
 
 #### AR3 inference
 
+##### Laptop preparation and read-only VS Code debug
+
+The laptop uses its own project `.venv` (Python 3.11), independently of the H100 training environment:
+`GIT_LFS_SKIP_SMUDGE=1 uv sync --locked --python 3.11`. Keep the entire checkpoint step directory,
+including `params/` and `assets/`, at `infer_checkpoint/29999`. The PaliGemma tokenizer belongs at
+`${OPENPI_DATA_HOME:-$HOME/.cache/openpi}/big_vision/paligemma_tokenizer.model`.
+Use the **lowmem** model configuration for these LoRA weights; no adapter merge or second training stage is
+required to run inference. Completing the offline step budget does not establish physical task success;
+LIFT's online corrective DAgger is an additional adaptation procedure. A still-zero force cross-attention
+output blocks force/tactile influence even when the reactive model runs; inference setup cannot repair a
+force pathway frozen during training.
+
+```bash
+./infer_oneclick.sh --dry-run  # commands only; no device access
+./infer_oneclick.sh --check    # local prerequisites only
+./infer_oneclick.sh            # start hardware preparation tabs; NOT policy action execution
+```
+
+The launcher reuses the sibling `ar3_ws`, `V3_Gripper`, and `lerobot_89236e_muscleTWAM` projects.
+It starts arm bringup without the MoveJ demo, the two remote SSH services, the tactile bridge, independent
+front/wrist Orbbec ROS cameras, and the camera tilt node at **40 degrees**. It does **not** start
+MessageBridge/Puppetry, retargeting, gripper teleoperation, recording, or a robot action-execution client.
+**Arm bringup powers the arm, and the camera servo moves.** Clear the workspace before running it;
+closing a terminal is not an emergency stop or a guarantee of arm power-off.
+SSH uses verified `known_hosts` entries and interactive/key authentication, never embedded passwords.
+The readiness tab requires actual sensor messages, measured tilt feedback, and valid, connected, initialized
+gripper feedback, not only advertised topics or a responsive gRPC service. The front camera uses MJPG;
+the Gemini 305 wrist camera uses its supported **YUYV** profile at 640x480/30 FPS with the **V4L2** UVC
+backend. On this setup, libuvc can report the wrist camera online but produce no frames even with YUYV.
+
+After the `ready` tab reports preparation complete, select **`infer_muscleVLTA_debug`** in VS Code's
+Run and Debug menu and press **F5**. This configuration loads the model **inside the debugged process on GPU 0**,
+reads real observations, and opens Rerun with cameras, tactile depth, wrenches, joint states and predicted actions.
+Before loading the model, it checks a complete real observation and fails early if an input is unavailable.
+No predicted action is sent to the arm or gripper. Outputs go to `outputs/infer_muscleVLTA_debug/`.
+Stop with Ctrl+C in the integrated terminal to save the summary and close the observation worker cleanly.
+
+To check inputs without loading the checkpoint, allocating GPU memory, or opening Rerun:
+
+```bash
+.venv/bin/python scripts/infer_musclevlta_debug.py --check-observations
+```
+
+This check is strictly read-only. A camera node/topic with no image samples is not ready; inspect the camera
+task's log and supported stream format. `GetAllState` reporting `connected=False`, `valid=False`, or
+`init_state != 1` requires motor preparation through your approved driver, not a larger inference timeout.
+
+Breakpoints in `scripts/ar3_force_visuotactile_client_example.py` and `src/openpi/policies/policy.py` run in
+that same process. JAX-compiled model functions normally hit Python breakpoints only during tracing; for
+line-by-line model debugging, temporarily add `"JAX_DISABLE_JIT": "1"` to the launch configuration's `env`
+(much slower). The ROS worker is deliberately a separate Python 3.12 process, not a second model process.
+
+Real observations come from `/front/color/image_raw`, `/wrist/color/image_raw`, `/joint_states`,
+and `/v3_gripper/tactile/{sensor_0,sensor_2}/{depth,wrench}`. Gripper position is obtained by read-only
+`GetAllState`; neither the launcher nor debug performs CAN `Connect`, motor initialization, or motion.
+If the gripper has no valid connected state, prepare it using the approved device workflow first;
+debug must not substitute a fabricated position. `--force-level 80` is the **known commanded SDK setting**,
+not a measured force; keep it consistent with the actual gripper setting. Missing, invalid or stale observations
+are errors, not zero-filled inputs. Finger wrenches remain in the same sensor-local frames used in training.
+
+Do not run the collection program alongside these ROS cameras: each camera must have only one owner.
+The launcher defaults to ROS domain **111** and the camera serials from the capture configuration.
+Use `./infer_oneclick.sh --help` for path/device overrides and flags that preserve existing nodes;
+when overriding topics/domain/device addresses, update `.vscode/launch.json` consistently.
+`infer_onecilck.sh` remains a compatibility alias for the originally requested spelling.
+
+For the separate WebSocket workflow below, use `./infer_oneclick.sh --with-policy` (or the standalone serving
+launcher). **Do not also press F5 with a second model on the same GPU.** Normal preparation intentionally
+does not start a policy server, leaving GPU memory available for local debugging.
+
+##### Explicit LIVE execution (physical motion)
+
+The original **`infer_muscleVLTA_debug`** remains prediction-only. The separate VS Code configuration
+**`infer_muscleVLTA_LIVE (MOVES ARM + GRIPPER)`** uses `--source ros --execute` and will send real targets.
+Stop the read-only model first to free its GPU memory. Only start LIVE with a clear workspace, a verified
+starting pose and checkpoint/action units, no teleoperation/replay/MoveIt goal, and an accessible physical
+emergency stop. Do not attach a debugger to the independent control worker.
+
+The LIVE configuration runs up to **300 control steps** with repeated closed-loop replanning, then requests
+a stop. This is 20 seconds at the nominal 15 Hz; inference and controller waits can make the run longer.
+The step budget is not automatic task-completion detection. Joint target increments remain limited to
+0.03 rad and joint command velocity to 0.1 rad/s; raw model targets farther than 0.25 rad from feedback
+are rejected, and gripper SDK speed remains 10. The worker additionally reads actual URDF joint limits and
+requires the active seven-joint position controller, fresh controller/sensor feedback, and exclusive discovered
+command ownership. These limits are not collision checking or a guarantee of safe contact. Other private gRPC
+clients cannot be discovered; ensure no other program commands the gripper.
+
+By default, LIVE first checks a complete observation through the read-only worker, before loading or warming
+the model. If `--initialize-gripper` is explicitly supplied, this full check is deferred to the LIVE worker
+after initialization; it is not bypassed. No policy action is allowed without valid real inputs.
+The model warms up before the control worker starts. Every observation authorizes one action only;
+expired observations, failed acknowledgements and malformed/out-of-range targets abort the session.
+After the first command, a separate watchdog requests a stop if no next command arrives within 0.5 s,
+including while the model/debugger is paused. Stop requests a short arm hold and gripper `Stop`, and checks
+controller hold feedback and the gripper acknowledgement. It does **not** power off the arm or replace a
+safety-rated emergency stop; RPC/ROS delays or failures can prevent a confirmed stop. A stopped session
+cannot resume commands: restart explicitly after inspecting the cause.
+
+The gripper CAN connection must already be prepared. LIVE does not disconnect that shared connection on
+exit. Motor calibration additionally requires `--initialize-gripper` (not enabled in the launch config);
+it can cause full-stroke motion. Changing the force or position predictions in LIVE controls the actual
+gripper; unlike read-only mode, acknowledged force commands become the next observation's force setting.
+Ctrl+C/EOF or the step budget ends the run with a stop request. Closing only Rerun does not stop control.
+
+##### WebSocket serving and replay
+
 Serve a trained checkpoint (defaults to the latest step of the newest `pi05_ar3_force_visuotactile_reactive_lowmem`
 run, GPU 6, `127.0.0.1:8000`; the header of the script lists all overrides):
 
