@@ -1,3 +1,4 @@
+from openpi.training import config as _config
 from scripts import serve_policy
 
 
@@ -22,3 +23,16 @@ def test_create_policy_uses_explicit_task_checkpoint(monkeypatch):
         "prompt": args.default_prompt,
     }
     assert args.host == "127.0.0.1"
+
+
+def test_server_metadata_reports_reactive_layout():
+    config = _config.get_config("pi05_ar3_force_visuotactile_reactive_debug")
+    assert serve_policy.server_metadata(config, {"note": "x"}) == {
+        "config_name": "pi05_ar3_force_visuotactile_reactive_debug",
+        "action_horizon": 4,
+        "reactive": True,
+        "cross_attention_latency": 1,
+        "tactile_shape": [72, 96],
+        "note": "x",
+    }
+    assert serve_policy.server_metadata(_config.get_config("pi05_ar3_base"))["reactive"] is False

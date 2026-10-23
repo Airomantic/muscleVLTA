@@ -9,7 +9,10 @@ the dataset. Zarr conversion presets live in preprocess_data/configs/ and are
 consumed by preprocess_data/iphone_zarr_to_lerobot.py.
 
 HF_LEROBOT_HOME is the dataset parent, with <repo_id>/meta/info.json and
-<repo_id>/data/ below it. AssetsConfig loads <assets_dir>/<asset_id>/norm_stats.json;
+<repo_id>/data/ below it. repo_id may also be an absolute dataset path. LeRobot
+v3.0 datasets (e.g. the muscleVLTA AR3 force + visuo-tactile recordings, see
+LeRobotAR3ForceVisuotactileDataConfig) are read natively by
+openpi.data.lerobot_v3. AssetsConfig loads <assets_dir>/<asset_id>/norm_stats.json;
 weight_loader points to a checkpoint's params/ directory. The checkpoint root
 environment variables below are read when Python imports this module.
 
@@ -27,20 +30,23 @@ import difflib
 import logging
 import os
 import pathlib
-from typing import Any, Protocol, TypeAlias
+from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
 from typing_extensions import override
 import tyro
 
+import openpi.data.lerobot_v3 as _lerobot_v3
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.tokenizer as _tokenizer
+import openpi.policies.ar3_force_visuotactile_policy as ar3_force_visuotactile_policy
 from openpi.policies.flexiv_transforms import ACTION_NAMES
 import openpi.policies.single_iphone_flexiv_policy as single_iphone_flexiv_policy
 import openpi.shared.download as _download
 from openpi.shared.episode_schema import DEFAULT_INTERVENTION_VALUE
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
@@ -60,6 +66,18 @@ _DEFAULT_TOWEL_CHECKPOINT_DIR = pathlib.Path(
 ).expanduser()
 _DEFAULT_TOWEL_REPO_ID = os.environ.get("OPENPI_TOWEL_REPO_ID", "flexiv/towelv3_100")
 _DEFAULT_TOWEL_ASSET_ID = os.environ.get("OPENPI_TOWEL_ASSET_ID", "flexiv/towelv3_100")
+# AR3 force + visuo-tactile (muscleVLTA) LeRobot v3.0 dataset: a local dataset directory (or a repo_id under
+# HF_LEROBOT_HOME), the asset id used for its norm stats (assets/<config-name>/<asset-id>/norm_stats.json) and the
+# initial weights. All three can also be overridden from the command line (--data.repo-id, --data.assets.asset-id).
+_DEFAULT_AR3_REPO_ID = os.environ.get(
+    "OPENPI_AR3_REPO_ID", "/data/jiang/utilData/ar3_force_computeChargingPullOut_force_aware"
+)
+_DEFAULT_AR3_ASSET_ID = os.environ.get("OPENPI_AR3_ASSET_ID", "ar3_force_computeChargingPullOut_force_aware")
+_DEFAULT_AR3_WEIGHT_PATH = os.environ.get(
+    "OPENPI_AR3_WEIGHT_PATH", "/data/jiang/checkpoints/openpi-assets/checkpoints/pi05_base/params"
+)
+# Single-episode example of the AR3 dataset shipped with the repository (used by the CPU debug config).
+_AR3_EXAMPLE_REPO_ID = str(pathlib.Path(__file__).resolve().parents[3] / "dataset_example")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -118,6 +136,10 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+
+    # Options of the native LeRobot v3.0 reader. Datasets whose meta/info.json declares codebase v3.0 are always read
+    # with it (using default options if this is None).
+    lerobot_v3: _lerobot_v3.LeRobotV3Options | None = None
 
 
 class GroupFactory(Protocol):
@@ -276,6 +298,119 @@ class LeRobotSingleiPhoneFlexivDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotAR3ForceVisuotactileDataConfig(DataConfigFactory):
+    """Rokae AR3 arm + Daimon tac G2 visuo-tactile gripper (muscleVLTA LeRobot v3.0 force-aware recordings).
+
+    The v3.0 dataset is read natively (openpi.data.lerobot_v3), no conversion to v2.1 is needed. Proprioception is
+    the 7 joint positions + gripper position, actions are 7 joint position targets (relative to the current joints
+    if delta_joint_actions) + absolute gripper position + gripper force level. Force-aware models (reactive_in_use)
+    additionally receive the 20D force sequence (7 joint torques + the 6D wrenches of both finger sensors + the gripper
+    force level, see use_force_level) over the
+    action horizon, and models with tactile_in_use the tactile depth images of both fingers (aligned causally to the
+    15 fps frames, downsampled to Pi0Config.tactile_shape and cached on first use). See
+    src/openpi/policies/ar3_force_visuotactile_policy.py for the exact layout.
+    """
+
+    # Predict joint targets relative to the current joint positions. Gripper position / force level stay absolute.
+    delta_joint_actions: bool = True
+    front_video_key: str = "observation.images.front"
+    wrist_video_key: str = "observation.images.wrist"
+    # "error" fails on missing video files, "black" replaces them by black frames (debugging only).
+    missing_video: Literal["error", "black"] = "error"
+    # Skip frames whose observation.state_valid / action_valid flags are not all set.
+    require_valid: bool = True
+    # Optional subset of episode indices, e.g. to hold out validation episodes.
+    episodes: tuple[int, ...] | None = None
+    # Directory of the tactile cache (defaults to $OPENPI_TACTILE_CACHE_DIR or ~/.cache/openpi/lerobot_v3_tactile).
+    tactile_cache_dir: str | None = None
+    # Tactile depth images are fed as log1p(tactile_gain * depth).
+    tactile_gain: float = 10.0
+    # Optional row-major 3x3 rotation expressing the sensor_2 wrench in the sensor_0 frame (None keeps raw frames).
+    finger_wrench_2_rotation: tuple[float, ...] | None = None
+    # Append the commanded gripper force level (action dim 8) to the 19D measured force input (-> 20D).
+    use_force_level: bool = True
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        ar3 = ar3_force_visuotactile_policy
+        use_force = bool(
+            getattr(model_config, "reactive_in_use", False) or getattr(model_config, "residual_policy_in_use", False)
+        )
+        use_tactile = bool(getattr(model_config, "tactile_in_use", False))
+        expected_force_dim = ar3.MODEL_FORCE_DIM if self.use_force_level else ar3.FORCE_DIM
+        if use_force and getattr(model_config, "force_dim", expected_force_dim) != expected_force_dim:
+            raise ValueError(
+                f"AR3 force inputs are {expected_force_dim}D ({ar3.FORCE_NAMES}"
+                f"{' + ' + ar3.FORCE_LEVEL_NAME if self.use_force_level else ''}); set Pi0Config.force_dim."
+            )
+        if use_tactile and getattr(model_config, "tactile_num_sensors", None) != len(ar3.TACTILE_SENSORS):
+            raise ValueError(f"AR3 tactile inputs come from {ar3.TACTILE_SENSORS}; set Pi0Config.tactile_num_sensors.")
+
+        repack_structure = {
+            ar3.FRONT_IMAGE_KEY: self.front_video_key,
+            ar3.WRIST_IMAGE_KEY: self.wrist_video_key,
+            ar3.STATE_KEY: "observation.state",
+            "actions": "action",
+            "prompt": "task",
+        }
+        sequence_keys = ["action"]
+        if use_force:
+            force_keys = {
+                ar3.ARM_EFFORT_KEY: "observation.arm_effort",
+                ar3.FINGER_WRENCH_KEYS[0]: "observation.gripper_wrench.sensor_0",
+                ar3.FINGER_WRENCH_KEYS[1]: "observation.gripper_wrench.sensor_2",
+            }
+            repack_structure.update(force_keys)
+            sequence_keys.extend(force_keys.values())
+        tactile_options = None
+        if use_tactile:
+            tactile_options = _lerobot_v3.TactileOptions(
+                sensors=ar3.TACTILE_SENSORS,
+                resolution=tuple(model_config.tactile_shape),
+                cache_dir=self.tactile_cache_dir,
+            )
+            repack_structure[ar3.TACTILE_KEY] = tactile_options.key
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                ar3.AR3ForceVisuotactileInputs(
+                    model_type=model_config.model_type,
+                    action_horizon=model_config.action_horizon,
+                    use_force=use_force,
+                    use_tactile=use_tactile,
+                    tactile_resolution=tuple(getattr(model_config, "tactile_shape", (72, 96))),
+                    tactile_gain=self.tactile_gain,
+                    finger_wrench_2_rotation=self.finger_wrench_2_rotation,
+                    use_force_level=self.use_force_level,
+                )
+            ],
+            outputs=[ar3.AR3ForceVisuotactileOutputs()],
+        )
+        if self.delta_joint_actions:
+            joint_mask = _transforms.make_bool_mask(ar3.NUM_ARM_JOINTS)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(joint_mask)],
+                outputs=[_transforms.AbsoluteActions(joint_mask)],
+            )
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            action_names=ar3.ACTION_NAMES,
+            action_sequence_keys=tuple(sequence_keys),
+            repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform(repack_structure)]),
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config).push(inputs=[ar3.AR3AppendForceLevel()]),
+            lerobot_v3=_lerobot_v3.LeRobotV3Options(
+                video_keys=(self.front_video_key, self.wrist_video_key),
+                missing_video=self.missing_video,
+                require_valid=self.require_valid,
+                tactile=tactile_options,
+                episodes=self.episodes,
+            ),
         )
 
 
@@ -501,6 +636,66 @@ pi05_residual_debug = dataclasses.replace(
     residual_dropout_rate=0.0,
     residual_wrench_hidden_dim=32,
 )
+
+# AR3 force + visuo-tactile (muscleVLTA, 15 fps). The action chunk covers 1 s. The reactive action expert reads, through
+# causal cross-attention with a 3 step (0.2 s) latency like the LIFT reactive policy, the memory of a multi-rate
+# mixture-of-transformers: a fast force expert over the 20D force sequence (7 joint torques + both finger wrenches +
+# gripper force level, one token per frame) and a slow tactile expert over the tactile depth features of both fingers
+# (one token per 3 frames = 5 Hz).
+pi05_ar3_force_visuotactile_reactive = pi0_config.Pi0Config(
+    pi05=True,
+    action_horizon=15,
+    discrete_state_input=True,
+    reactive_in_use=True,
+    use_state=False,
+    original_head=False,
+    cross_attention_latency=3,
+    force_dim=ar3_force_visuotactile_policy.MODEL_FORCE_DIM,
+    force_encoder="mot",
+    tactile_stride=3,
+    mot_width=256,
+    mot_depth=2,
+    mot_num_heads=4,
+    tactile_in_use=True,
+    tactile_num_sensors=len(ar3_force_visuotactile_policy.TACTILE_SENSORS),
+    tactile_shape=(72, 96),
+    tactile_feature_dim=64,
+)
+
+pi05_ar3_force_visuotactile_reactive_lora = dataclasses.replace(
+    pi05_ar3_force_visuotactile_reactive,
+    paligemma_variant="gemma_2b_lora",
+    action_expert_variant="gemma_300m_lora",
+    reactive_action_expert_variant="gemma_300m_lora",
+)
+
+
+def _ar3_train_config(name: str, model: pi0_config.Pi0Config, **kwargs: Any) -> TrainConfig:
+    """Full fine-tuning of pi05_base on the AR3 force + visuo-tactile dataset (LIFT reactive recipe)."""
+    defaults: dict[str, Any] = {
+        "data": LeRobotAR3ForceVisuotactileDataConfig(
+            repo_id=_DEFAULT_AR3_REPO_ID,
+            assets=AssetsConfig(asset_id=_DEFAULT_AR3_ASSET_ID),
+        ),
+        "batch_size": 32,
+        "num_workers": 8,
+        "lr_schedule": _optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        "optimizer": _optimizer.AdamW(clip_gradient_norm=1.0),
+        "ema_decay": 0.999,
+        "weight_loader": weight_loaders.CheckpointWeightLoader(_DEFAULT_AR3_WEIGHT_PATH),
+        "copy_reactive_from_action_expert": model.reactive_in_use,
+        "num_train_steps": 30_000,
+        "keep_period": 5_000,
+        "fsdp_devices": 2,
+    }
+    defaults.update(kwargs)
+    return TrainConfig(name=name, model=model, **defaults)
+
 
 # Use `get_config` if you need to get a config by name in your
 _CONFIGS = [
@@ -780,6 +975,74 @@ _CONFIGS = [
         fsdp_devices=1,
         wandb_enabled=False,
         online_use_wrench=True,
+    ),
+    #
+    # AR3 force + visuo-tactile (muscleVLTA, LeRobot v3.0).
+    #
+    # Joint torques + both finger wrenches + tactile depth of both fingers (main config).
+    _ar3_train_config("pi05_ar3_force_visuotactile_reactive", pi05_ar3_force_visuotactile_reactive),
+    # Ablation without the tactile depth images (joint torques + finger wrenches only).
+    _ar3_train_config(
+        "pi05_ar3_force_reactive",
+        dataclasses.replace(pi05_ar3_force_visuotactile_reactive, tactile_in_use=False),
+    ),
+    # Vision-language-action baseline without force / tactile inputs.
+    _ar3_train_config(
+        "pi05_ar3_base",
+        dataclasses.replace(pi05_ar3_force_visuotactile_reactive, reactive_in_use=False, tactile_in_use=False),
+    ),
+    # Low-memory variant for shared GPUs (~8 GB free per GPU): LoRA on all Gemma experts, frozen (bf16) SigLIP,
+    # no EMA and a small batch. The MoT force / tactile memory and the tactile encoder are trained fully.
+    _ar3_train_config(
+        "pi05_ar3_force_visuotactile_reactive_lowmem",
+        pi05_ar3_force_visuotactile_reactive_lora,
+        freeze_filter=nnx.Any(
+            pi05_ar3_force_visuotactile_reactive_lora.get_freeze_filter(), nnx_utils.PathRegex(".*img.*")
+        ),
+        batch_size=4,
+        num_workers=4,
+        ema_decay=None,
+        save_interval=500,
+    ),
+    # CPU smoke test on the single-episode dataset_example (no videos -> black frames, random tiny model).
+    TrainConfig(
+        name="pi05_ar3_force_visuotactile_reactive_debug",
+        model=dataclasses.replace(
+            pi05_ar3_force_visuotactile_reactive,
+            paligemma_variant="dummy",
+            action_expert_variant="dummy",
+            reactive_action_expert_variant="dummy",
+            cross_attention_config="dummy",
+            action_horizon=4,
+            cross_attention_latency=1,
+            tactile_feature_dim=16,
+            tactile_stride=2,
+            mot_width=32,
+            mot_depth=1,
+        ),
+        data=LeRobotAR3ForceVisuotactileDataConfig(
+            repo_id=_AR3_EXAMPLE_REPO_ID,
+            assets=AssetsConfig(asset_id="ar3_dataset_example"),
+            missing_video="black",
+        ),
+        batch_size=2,
+        num_workers=0,
+        lr_schedule=_optimizer.RsqrtDecaySchedule(warmup_steps=1, peak_lr=5e-5, timescale=10),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        copy_reactive_from_action_expert=True,
+        # The SigLIP image tower is not shrunk by the dummy variants; freeze it to keep the smoke test small.
+        freeze_filter=nnx_utils.PathRegex(".*img.*"),
+        overwrite=True,
+        save_interval=1,
+        log_interval=1,
+        plot_interval=0,
+        keep_period=1,
+        num_train_steps=2,
+        fsdp_devices=1,
+        wandb_enabled=False,
+        exp_name="debug",
     ),
 ]
 

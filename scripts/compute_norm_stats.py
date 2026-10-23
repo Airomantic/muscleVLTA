@@ -1,20 +1,25 @@
 """Compute normalization statistics after applying a config's data transforms.
 
 Run with --config-name CONFIG after setting its dataset repo_id. Statistics are
-written to <config.assets_dirs>/<repo_id>/norm_stats.json (by default,
-assets/<config>/<repo_id>/norm_stats.json), not to a pretrained checkpoint.
-To train with them, point AssetsConfig.assets_dir at assets/<config> and set
-asset_id to the repo_id. Reuse pretrained statistics only if their observation
-and action conventions match your data.
+written to <config.assets_dirs>/<asset_id>/norm_stats.json (by default,
+assets/<config>/<asset_id>/norm_stats.json, where asset_id defaults to the
+repo_id), not to a pretrained checkpoint. This is the location from which
+training loads them. Reuse pretrained statistics only if their observation and
+action conventions match your data.
 
 --max-frames optionally limits the dataset scan. State, action, and wrench
 statistics are computed only for fields present in the transformed batches.
+Videos of LeRobot v3.0 datasets are not decoded, since images do not enter the
+statistics (tactile sidecars are aligned and cached on the first run).
 """
+
+import dataclasses
 
 import numpy as np
 import tqdm
 import tyro
 
+import openpi.data.lerobot_v3 as _lerobot_v3
 import openpi.models.model as _model
 import openpi.shared.normalize as normalize
 import openpi.training.config as _config
@@ -66,6 +71,11 @@ def create_torch_dataloader(
 def main(config_name: str, max_frames: int | None = None):
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
+    if data_config.lerobot_v3 is not None or (
+        data_config.repo_id is not None and _lerobot_v3.is_lerobot_v3_dataset(data_config.repo_id)
+    ):
+        options = data_config.lerobot_v3 or _lerobot_v3.LeRobotV3Options()
+        data_config = dataclasses.replace(data_config, lerobot_v3=dataclasses.replace(options, decode_videos=False))
 
     data_loader, num_batches = create_torch_dataloader(
         data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
@@ -82,7 +92,7 @@ def main(config_name: str, max_frames: int | None = None):
 
     norm_stats = {key: stat.get_statistics() for key, stat in stats.items() if stat.count > 1}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    output_path = config.assets_dirs / (data_config.asset_id or data_config.repo_id)
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

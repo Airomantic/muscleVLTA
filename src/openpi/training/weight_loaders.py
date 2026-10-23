@@ -106,6 +106,16 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
     result = {}
     for k, v in flat_loaded.items():
         if k in flat_ref:
+            if tuple(v.shape) != tuple(flat_ref[k].shape):
+                # E.g. the force encoder of a checkpoint trained with a different force_dim. The parameter keeps its
+                # initialization (or is merged from the reference parameters below).
+                logger.warning(
+                    "Not loading %s: checkpoint shape %s does not match the model shape %s.",
+                    k,
+                    tuple(v.shape),
+                    tuple(flat_ref[k].shape),
+                )
+                continue
             result[k] = v.astype(flat_ref[k].dtype) if v.dtype != flat_ref[k].dtype else v
 
     flat_loaded.clear()

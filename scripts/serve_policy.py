@@ -18,6 +18,16 @@ Use packages/openpi-client/src/openpi_client/websocket_client_policy.py to send
 observations. The single-arm keys and output action layout are defined in
 src/openpi/policies/single_iphone_flexiv_policy.py. Robot control, sensing, and
 execution of the returned action chunks are the client's responsibility.
+
+Force-reactive (LIFT) checkpoints can also be run chunk by chunk with the
+client's reactive_replan / reactive_step: the VLM runs once per chunk and the
+reactive expert is re-run with the newest force readings every k steps. The
+metadata sent on connection reports the action horizon, the reactive latency
+and the tactile image shape.
+
+AR3 force + visuo-tactile (muscleVLTA): use scripts/serve_ar3_force_visuotactile.sh
+and the client in scripts/ar3_force_visuotactile_client_example.py; the keys
+are defined in src/openpi/policies/ar3_force_visuotactile_policy.py.
 """
 
 import dataclasses
@@ -47,9 +57,24 @@ def create_policy(args: Args) -> _policy.Policy:
     )
 
 
+def server_metadata(config: _config.TrainConfig, policy_metadata: dict | None = None) -> dict:
+    """Metadata sent to every client on connection: the policy metadata plus the action / force input layout."""
+    model = config.model
+    metadata = {
+        "config_name": config.name,
+        "action_horizon": model.action_horizon,
+        "reactive": bool(getattr(model, "reactive_in_use", False)),
+    }
+    if metadata["reactive"]:
+        metadata["cross_attention_latency"] = model.cross_attention_latency
+    if getattr(model, "tactile_in_use", False):
+        metadata["tactile_shape"] = list(model.tactile_shape)
+    return {**metadata, **(policy_metadata or {})}
+
+
 def main(args: Args) -> None:
     policy = create_policy(args)
-    policy_metadata = policy.metadata
+    policy_metadata = server_metadata(_config.get_config(args.config_name), policy.metadata)
     if args.record:
         policy = _policy.PolicyRecorder(policy, "policy_records")
 
