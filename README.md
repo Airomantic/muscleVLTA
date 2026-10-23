@@ -61,6 +61,15 @@ GIT_LFS_SKIP_SMUDGE=1 uv sync --locked
 
 Dependencies are specified in `pyproject.toml` and pinned in `uv.lock`.
 
+On an unstable connection (for example a proxy that drops long downloads), use
+the resumable wrapper instead. It prefetches the locked wheels with `curl -C -`,
+verifies their sha256, and rerunning it continues interrupted downloads:
+
+```bash
+uv run --no-project --python 3.11 --with packaging \
+  scripts/uv_resumable_sync.py -- --python 3.11
+```
+
 ## 📚 Offline Training
 
 1. **Prepare data.** Use LeRobot datasets with wrist images (`left_wrist_img`),
