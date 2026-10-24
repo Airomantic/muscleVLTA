@@ -15,7 +15,7 @@ Observation sources (--source):
     uv run scripts/ar3_force_visuotactile_client_example.py --source dataset \\
         --dataset /data/jiang/utilData/ar3_force_computeChargingPullOut_force_aware --episode 16 \\
         --output-dir replay/episode_16 --rerun replay/episode_16.rrd
-    # robot PC (needs numpy + packages/openpi-client, rerun-sdk only for --rerun)
+    # robot PC (needs numpy + packages/openpi-client, rerun-sdk only for --rerun, pyarrow + pandas for --record-parquet)
     python scripts/ar3_force_visuotactile_client_example.py --host 127.0.0.1 --port 8000 --source my_ar3:AR3Robot
 
 Observation sent to the server (layout of the training data, see src/openpi/policies/ar3_force_visuotactile_policy.py):
@@ -59,8 +59,11 @@ Outputs: a summary of the inference latency and, for replayed episodes, of the a
 (per-joint MAE next to the "hold position" baseline, gripper / force level MAE, joint MAE per chunk step);
 --output-dir writes rollout.npz (per-step state, policy / executed / recorded actions) and summary.json; --rerun
 (spawn | FILE.rrd | rerun+http://HOST:9876/proxy) logs every step with the panels of the dataset viewer (cameras,
-gripper target / actual, force level, joint actions / state, arm effort, finger wrenches, tactile depth) plus the
-policy actions, a per-joint "policy vs recorded" tab and the inference latency.
+gripper target / actual, force level, joint state, arm effort, finger wrenches, tactile depth) plus the policy
+actions, a per-joint "policy vs measured state" tab and the inference latency; dataset replay adds the recorded
+actions ("policy vs recorded"). --record-parquet DIR appends every run as one episode to a LeRobot v3.0 dataset
+without videos (joints + gripper position, joint torques, executed and policy actions per step), to compare the
+inference runs with the training data.
 """
 
 from __future__ import annotations
@@ -69,6 +72,7 @@ import argparse
 import collections
 from collections.abc import Callable, Sequence
 import dataclasses
+import datetime
 import importlib
 import json
 import logging
@@ -97,11 +101,14 @@ ACTION_DIM = 9
 GRIPPER_INDEX = 7
 FORCE_LEVEL_INDEX = 8
 JOINT_NAMES = tuple(f"joint{i}.pos" for i in range(1, NUM_JOINTS + 1))
+STATE_NAMES = (*JOINT_NAMES, "gripper.position_sdk")
+ACTION_NAMES = (*STATE_NAMES, "gripper.force_level")
 TORQUE_NAMES = tuple(f"joint{i}.torque_Nm" for i in range(1, NUM_JOINTS + 1))
 WRENCH_COMPONENTS = ("Fx", "Fy", "Fz", "Mx", "My", "Mz")
 TACTILE_SENSORS = ("sensor_0", "sensor_2")
 GRIPPER_POSITION_RANGE = (0.0, 1000.0)
 FORCE_LEVEL_RANGE = (20.0, 100.0)
+DATASET_FPS = 15.0  # frame rate of the training data and of the predicted actions
 # Video features of the LeRobot v3.0 dataset (dataset source, rerun entity paths).
 FRONT_VIDEO_FEATURE = "observation.images.front"
 WRIST_VIDEO_FEATURE = "observation.images.wrist"
@@ -600,6 +607,221 @@ def format_summary(summary: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+# --record-parquet: LeRobot v3.0 dataset of inference runs (one episode per run) without videos or tactile data.
+RECORD_DATA_PATH = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
+RECORD_EPISODES_PATH = "meta/episodes/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
+RECORD_CHUNKS_SIZE = 1000
+RECORD_QUANTILES = (0.01, 0.10, 0.50, 0.90, 0.99)
+RECORD_FEATURES: dict[str, dict[str, Any]] = {
+    # Measured before the action of the step, as in the training data (observation.state[:8] there).
+    "observation.state": {"dtype": "float32", "shape": [STATE_DIM], "names": list(STATE_NAMES)},
+    "observation.arm_effort": {"dtype": "float32", "shape": [NUM_JOINTS], "names": list(TORQUE_NAMES)},
+    # Executed action: the target acknowledged by the driver after the safety limits.
+    "action": {"dtype": "float32", "shape": [ACTION_DIM], "names": list(ACTION_NAMES)},
+    # Raw policy action and its step within the action chunk (0: chunk start, i.e. replan).
+    "policy.action": {"dtype": "float32", "shape": [ACTION_DIM], "names": list(ACTION_NAMES)},
+    "policy.chunk_step": {"dtype": "int64", "shape": [1], "names": None},
+    # Wall-clock time of the step since the episode start; timestamp is the nominal frame_index / fps.
+    "sync.control_time_s": {"dtype": "float64", "shape": [1], "names": ["monotonic"]},
+    "timestamp": {"dtype": "float32", "shape": [1], "names": None},
+    "frame_index": {"dtype": "int64", "shape": [1], "names": None},
+    "episode_index": {"dtype": "int64", "shape": [1], "names": None},
+    "index": {"dtype": "int64", "shape": [1], "names": None},
+    "task_index": {"dtype": "int64", "shape": [1], "names": None},
+}
+
+
+def _write_atomic(path: pathlib.Path, write: Callable[[pathlib.Path], Any]) -> None:
+    """Writes through a temporary file, so that an interrupted write never leaves a truncated file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    write(temporary)
+    os.replace(temporary, path)
+
+
+def _arrow_column(values: np.ndarray):
+    """Scalar column for [N] values, fixed-size list column for [N, D] values (the LeRobot layout)."""
+    import pyarrow as pa
+
+    if values.ndim == 1:
+        return pa.array(values)
+    return pa.FixedSizeListArray.from_arrays(pa.array(values.reshape(-1)), values.shape[1])
+
+
+def _column_values(column) -> np.ndarray:
+    import pyarrow as pa
+
+    array = column.combine_chunks()
+    if pa.types.is_fixed_size_list(array.type):
+        return array.flatten().to_numpy(zero_copy_only=False).reshape(len(array), array.type.list_size)
+    return array.to_numpy(zero_copy_only=False)
+
+
+def _feature_stats(values: np.ndarray) -> dict[str, list]:
+    """LeRobot statistics of a feature over frames, per dimension: min, max, mean, std, count and quantiles."""
+    values = np.asarray(values, np.float64).reshape(len(values), -1)
+    stats = {
+        "min": values.min(axis=0).tolist(),
+        "max": values.max(axis=0).tolist(),
+        "mean": values.mean(axis=0).tolist(),
+        "std": values.std(axis=0).tolist(),
+        "count": [len(values)],
+    }
+    for quantile, value in zip(RECORD_QUANTILES, np.quantile(values, RECORD_QUANTILES, axis=0), strict=True):
+        stats[f"q{round(quantile * 100):02d}"] = value.tolist()
+    return stats
+
+
+class ParquetDatasetRecorder:
+    """Appends every run as one episode to a LeRobot v3.0 dataset without videos (--record-parquet DIR).
+
+    The layout follows the training data (meta/info.json, meta/tasks.parquet, meta/episodes/, meta/stats.json and
+    data/chunk-XXX/file-XXX.parquet; readable with openpi.data.lerobot_v3), so inference runs can be compared with
+    the demonstrations. RECORD_FEATURES lists the per-step columns; camera videos, finger wrenches and tactile depth
+    are not recorded. The episode metadata adds inference/* columns (config, mode, CLI arguments, start time and
+    outcome: completed, interrupted or the error). The steps are written by save() when the run ends, also after
+    Ctrl+C or an error. Needs pyarrow and pandas.
+    """
+
+    def __init__(self, root: str | os.PathLike[str], *, fps: float) -> None:
+        self.root = pathlib.Path(root).expanduser().resolve()
+        # Without a control rate limit (fps <= 0, e.g. dataset replay) the frames are timed at the action rate.
+        self.fps = float(fps) if 0 < fps < np.inf else DATASET_FPS
+        self.saved: dict[str, Any] | None = None
+        self._columns: dict[str, list] = collections.defaultdict(list)
+        self._started_at: str | None = None
+        # Fails before the run, and before any motion, if episodes cannot be appended to this directory.
+        self._read_info()
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def _read_info(self) -> dict[str, Any] | None:
+        """Info of the existing recording (None for a new one); refuses other directories and datasets."""
+        info_path = self.root / "meta" / "info.json"
+        if not info_path.is_file():
+            if self.root.exists() and any(self.root.iterdir()):
+                raise ValueError(f"{self.root} is neither empty nor an inference recording; choose another directory.")
+            return None
+        info = json.loads(info_path.read_text())
+        if info.get("features") != RECORD_FEATURES or float(info.get("fps", 0)) != self.fps:
+            raise ValueError(
+                f"{self.root} is not an inference recording with these features at {self.fps:g} fps (e.g. a training "
+                "dataset or an older recording); choose another directory."
+            )
+        return info
+
+    def _read_tasks(self) -> dict[str, int]:
+        path = self.root / "meta" / "tasks.parquet"
+        if not path.is_file():
+            return {}
+        import pyarrow.parquet as pq
+
+        table = pq.read_table(path)
+        tasks = zip(table.column("task").to_pylist(), table.column("task_index").to_pylist(), strict=True)
+        return dict(sorted(tasks, key=lambda item: item[1]))
+
+    def __call__(self, step: Step) -> None:
+        if self._started_at is None:
+            self._started_at = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+        observation = step.observation
+        effort = observation.get(ARM_EFFORT_KEY)
+        columns = self._columns
+        columns["observation.state"].append(np.asarray(observation[STATE_KEY], np.float32)[:STATE_DIM])
+        # Latest reading (NaN if the source has no joint torques).
+        columns["observation.arm_effort"].append(
+            np.full(NUM_JOINTS, np.nan, np.float32)
+            if effort is None
+            else np.asarray(effort, np.float32).reshape(-1, NUM_JOINTS)[-1]
+        )
+        columns["action"].append(step.action)
+        columns["policy.action"].append(step.policy_action)
+        columns["policy.chunk_step"].append(step.chunk_step)
+        columns["sync.control_time_s"].append(step.time_s)
+
+    def save(self, *, task: str, outcome: str = "completed", info: dict[str, Any] | None = None) -> dict | None:
+        """Appends the executed steps as a new episode; returns its summary (None without executed steps)."""
+        length = len(self._columns["action"])
+        if not length:
+            logging.info("No executed step: nothing appended to %s", self.root)
+            return None
+        import pandas as pd
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        dataset_info = self._read_info()
+        episode_index = int(dataset_info["total_episodes"]) if dataset_info else 0
+        start = int(dataset_info["total_frames"]) if dataset_info else 0
+        tasks = self._read_tasks()
+        task_index = tasks.setdefault(task, len(tasks))
+        frame_index = np.arange(length)
+        values = {
+            **self._columns,
+            "timestamp": frame_index / self.fps,
+            "frame_index": frame_index,
+            "episode_index": np.full(length, episode_index),
+            "index": start + frame_index,
+            "task_index": np.full(length, task_index),
+        }
+        values = {key: np.asarray(values[key], feature["dtype"]) for key, feature in RECORD_FEATURES.items()}
+        table = pa.table({key: _arrow_column(value) for key, value in values.items()})
+        location = dict(zip(("chunk_index", "file_index"), divmod(episode_index, RECORD_CHUNKS_SIZE), strict=True))
+        _write_atomic(self.root / RECORD_DATA_PATH.format(**location), lambda path: pq.write_table(table, path))
+
+        stats = {
+            f"stats/{key}/{name}": stat for key, value in values.items() for name, stat in _feature_stats(value).items()
+        }
+        episode = {
+            "episode_index": episode_index,
+            "tasks": [task],
+            "length": length,
+            "data/chunk_index": location["chunk_index"],
+            "data/file_index": location["file_index"],
+            "dataset_from_index": start,
+            "dataset_to_index": start + length,
+            **{f"inference/{key}": value for key, value in (info or {}).items()},
+            "inference/started_at": self._started_at,
+            "inference/outcome": outcome,
+            **stats,
+            "meta/episodes/chunk_index": location["chunk_index"],
+            "meta/episodes/file_index": location["file_index"],
+        }
+        _write_atomic(
+            self.root / RECORD_EPISODES_PATH.format(**location),
+            lambda path: pq.write_table(pa.Table.from_pylist([episode]), path),
+        )
+        # LeRobot stores the task strings as the named pandas index.
+        task_table = pd.DataFrame({"task_index": list(tasks.values())}, index=pd.Index(list(tasks), name="task"))
+        _write_atomic(self.root / "meta" / "tasks.parquet", task_table.to_parquet)
+        data = pa.concat_tables(
+            [pq.read_table(path, columns=list(RECORD_FEATURES)) for path in sorted(self.root.glob("data/*/*.parquet"))]
+        )
+        dataset_stats = {key: _feature_stats(_column_values(data.column(key))) for key in RECORD_FEATURES}
+        _write_atomic(
+            self.root / "meta" / "stats.json", lambda path: path.write_text(json.dumps(dataset_stats, indent=4))
+        )
+        dataset_info = {
+            "codebase_version": "v3.0",
+            "fps": int(self.fps) if self.fps.is_integer() else self.fps,
+            "total_episodes": episode_index + 1,
+            "total_frames": start + length,
+            "total_tasks": len(tasks),
+            "chunks_size": RECORD_CHUNKS_SIZE,
+            "data_files_size_in_mb": 100,
+            "video_files_size_in_mb": 200,
+            "data_path": RECORD_DATA_PATH,
+            "video_path": None,
+            "robot_type": "rokae_ar3",
+            "splits": {"train": f"0:{episode_index + 1}"},
+            "features": RECORD_FEATURES,
+        }
+        # Written last: the new totals make the episode part of the dataset.
+        _write_atomic(
+            self.root / "meta" / "info.json", lambda path: path.write_text(json.dumps(dataset_info, indent=4))
+        )
+        self.saved = {"root": str(self.root), "episode_index": episode_index, "frames": length, "outcome": outcome}
+        logging.info("Recorded episode %d (%d steps, %s) in %s", episode_index, length, outcome, self.root)
+        return self.saved
+
+
 RECORDED_COLOR = (31, 119, 180)
 POLICY_COLOR = (255, 127, 14)
 STATE_COLOR = (127, 127, 127)
@@ -608,10 +830,11 @@ STATE_COLOR = (127, 127, 127)
 class RerunLogger:
     """Logs every control step to rerun (pip install rerun-sdk; the openpi environment has it).
 
-    The first tab mirrors the dataset viewer (cameras, tac G2 gripper target / actual, force level, recorded joint
-    actions, state, arm effort, finger wrenches, tactile depth as sent to the model) and adds the policy actions; the
-    second tab overlays policy and recorded targets per joint, with the inference latency and a log of the server
-    calls. Timelines: frame_index (recorded frame index for dataset replay) and timestamp [s].
+    The first tab mirrors the dataset viewer (cameras, tac G2 gripper target / actual, force level, state, arm effort,
+    finger wrenches, tactile depth as sent to the model) and adds the policy actions; the second tab overlays the
+    policy targets and the measured state per joint, with the inference latency and a log of the server calls.
+    With `recorded` (dataset replay) both tabs add the recorded actions. Timelines: frame_index (recorded frame index
+    for dataset replay) and timestamp [s].
     """
 
     def __init__(
@@ -621,14 +844,16 @@ class RerunLogger:
         application_id: str = "ar3_force_visuotactile_inference",
         jpeg_quality: int = 85,
         read_only: bool = False,
+        recorded: bool = True,
     ):
         import rerun as rr
         import rerun.blueprint as rrb
 
         self._rr = rr
         self._jpeg_quality = jpeg_quality
+        self._recorded = recorded
         self._recording = rr.RecordingStream(application_id)
-        blueprint = self.blueprint(rrb, read_only=read_only)
+        blueprint = self.blueprint(rrb, read_only=read_only, recorded=recorded)
         if target == "spawn":
             self._recording.spawn(default_blueprint=blueprint)
         elif "://" in target:
@@ -644,7 +869,7 @@ class RerunLogger:
             )
 
     @staticmethod
-    def blueprint(rrb, *, read_only: bool = False):
+    def blueprint(rrb, *, read_only: bool = False, recorded: bool = True):
         def series(origin: str, name: str):
             return rrb.TimeSeriesView(origin=origin, name=name)
 
@@ -653,7 +878,8 @@ class RerunLogger:
             rrb.Spatial2DView(origin=WRIST_VIDEO_FEATURE, name=WRIST_VIDEO_FEATURE),
             series("gripper", "tac G2 gripper (SDK position: 0 closed / 1000 open)"),
             series("gripper_force_level", "gripper_force_level (command)"),
-            series("action", "action (recorded)"),
+            # Only dataset replay has recorded (teleoperation) actions; live sources would show an empty panel.
+            *([series("action", "action (recorded)")] if recorded else []),
             series("policy/action", "action (policy)"),
             series("state", "state"),
             series("observation.arm_effort", "observation.arm_effort"),
@@ -670,7 +896,11 @@ class RerunLogger:
             series("inference", "inference round trip / server [ms]"),
             rrb.TextLogView(origin="inference_log", name="server calls"),
             grid_columns=3,
-            name="predictions vs measured state" if read_only else "policy vs recorded",
+            name="policy vs recorded"
+            if recorded
+            else "predictions vs measured state"
+            if read_only
+            else "policy vs measured state",
         )
         return rrb.Blueprint(rrb.Tabs(episode, compare))
 
@@ -678,22 +908,24 @@ class RerunLogger:
         rr = self._rr
         styles = {
             "state": rr.SeriesLines(names=JOINT_NAMES),
-            "action": rr.SeriesLines(names=JOINT_NAMES),
             "policy/action": rr.SeriesLines(names=JOINT_NAMES),
             "observation.arm_effort": rr.SeriesLines(names=TORQUE_NAMES),
-            "gripper/target": rr.SeriesLines(names="target (recorded)", colors=RECORDED_COLOR),
             "gripper/actual": rr.SeriesLines(names="actual", colors=STATE_COLOR),
             "gripper/policy": rr.SeriesLines(names="policy", colors=POLICY_COLOR),
-            "gripper_force_level/command": rr.SeriesLines(names="command (recorded)", colors=RECORDED_COLOR),
             "gripper_force_level/input_setting": rr.SeriesLines(names="input force setting", colors=STATE_COLOR),
             "gripper_force_level/policy": rr.SeriesLines(names="policy", colors=POLICY_COLOR),
             "inference/round_trip_ms": rr.SeriesLines(names="round trip"),
             "inference/server_ms": rr.SeriesLines(names="server"),
         }
+        if self._recorded:
+            styles["action"] = rr.SeriesLines(names=JOINT_NAMES)
+            styles["gripper/target"] = rr.SeriesLines(names="target (recorded)", colors=RECORDED_COLOR)
+            styles["gripper_force_level/command"] = rr.SeriesLines(names="command (recorded)", colors=RECORDED_COLOR)
         for sensor in TACTILE_SENSORS:
             styles[f"observation.gripper_wrench.{sensor}"] = rr.SeriesLines(names=WRENCH_COMPONENTS)
         for name in JOINT_NAMES:
-            styles[f"compare/{name}/recorded"] = rr.SeriesLines(names="recorded", colors=RECORDED_COLOR)
+            if self._recorded:
+                styles[f"compare/{name}/recorded"] = rr.SeriesLines(names="recorded", colors=RECORDED_COLOR)
             styles[f"compare/{name}/policy"] = rr.SeriesLines(names="policy", colors=POLICY_COLOR)
             styles[f"compare/{name}/state"] = rr.SeriesLines(names="state", colors=STATE_COLOR)
         for path, style in styles.items():
@@ -900,6 +1132,13 @@ def build_parser() -> argparse.ArgumentParser:
     outputs = parser.add_argument_group("outputs")
     outputs.add_argument("--output-dir", default=None, help="write rollout.npz and summary.json")
     outputs.add_argument("--rerun", default=None, help="spawn | FILE.rrd | rerun+http://HOST:9876/proxy")
+    outputs.add_argument(
+        "--record-parquet",
+        default=None,
+        metavar="DIR",
+        help="append the run as one episode to a LeRobot v3.0 dataset without videos / tactile data (new or "
+        "previous --record-parquet directory): state, joint torques, executed and policy actions per step",
+    )
     return parser
 
 
@@ -952,6 +1191,9 @@ def run(args: argparse.Namespace, *, policy_client=None) -> dict[str, Any]:
         raise ValueError(f"--execute-steps must be in [0, {action_horizon}], got {args.execute_steps}")
 
     prompt = args.prompt or PROMPT
+    fps = args.fps if args.fps is not None else (0.0 if args.source == "dataset" else DATASET_FPS)
+    # Before the warm-up and the robot: an unusable recording directory fails before any motion.
+    dataset_recorder = ParquetDatasetRecorder(args.record_parquet, fps=fps) if args.record_parquet else None
     if args.source == "ros":
         logging.warning("Warming the policy on synthetic observations BEFORE creating the hardware control worker.")
         run_policy(
@@ -971,7 +1213,6 @@ def run(args: argparse.Namespace, *, policy_client=None) -> dict[str, Any]:
     if read_only:
         logging.warning("READ-ONLY preview: predicted actions will not be sent to the arm or gripper.")
     prompt = args.prompt or getattr(robot, "task", None) or PROMPT
-    fps = args.fps if args.fps is not None else (0.0 if args.source == "dataset" else 15.0)
     episode = getattr(robot, "episode", None)
     logging.info(
         "Running %s mode%s with %s%s, prompt %r",
@@ -983,13 +1224,18 @@ def run(args: argparse.Namespace, *, policy_client=None) -> dict[str, Any]:
     )
     recorder = EpisodeRecorder()
     callbacks: list[Callable[[Step], None]] = [log_request, recorder]
+    if dataset_recorder is not None:
+        callbacks.append(dataset_recorder)
     viewer = None
+    outcome = "completed"
     try:
         if args.rerun:
             application_id = "ar3_force_visuotactile_inference" + (f"/episode_{episode}" if episode is not None else "")
             if read_only:
                 application_id += "/read_only"
-            viewer = RerunLogger(args.rerun, application_id=application_id, read_only=read_only)
+            viewer = RerunLogger(
+                args.rerun, application_id=application_id, read_only=read_only, recorded=hasattr(robot, "recorded")
+            )
             callbacks.append(viewer)
         steps = run_policy(
             client,
@@ -1009,14 +1255,32 @@ def run(args: argparse.Namespace, *, policy_client=None) -> dict[str, Any]:
         if args.max_steps > 0 and steps >= args.max_steps:
             logging.info("Control step budget reached (--max-steps=%d); requesting normal shutdown.", args.max_steps)
     except KeyboardInterrupt:
+        outcome = "interrupted"
         logging.info("Stopped.")
+    except Exception as exc:
+        outcome = f"error: {type(exc).__name__}: {exc}"
+        raise
     finally:
         try:
             if callable(close := getattr(robot, "close", None)):
                 close()
         finally:
-            if viewer is not None:
-                viewer.close()
+            try:
+                # Saved before the viewer is closed, so that a hanging rerun flush cannot lose the episode.
+                if dataset_recorder is not None:
+                    dataset_recorder.save(
+                        task=prompt,
+                        outcome=outcome,
+                        info={
+                            "config_name": str(metadata.get("config_name") or ""),
+                            "mode": mode,
+                            "reactive_k": reactive_k if mode == "reactive" else 0,
+                            "args": json.dumps(vars(args), default=str),
+                        },
+                    )
+            finally:
+                if viewer is not None:
+                    viewer.close()
 
     summary = {
         "config_name": metadata.get("config_name"),
@@ -1029,6 +1293,8 @@ def run(args: argparse.Namespace, *, policy_client=None) -> dict[str, Any]:
         "prompt": prompt,
         **recorder.summary(),
     }
+    if dataset_recorder is not None:
+        summary["record_parquet"] = dataset_recorder.saved
     logging.info("Summary: %s", format_summary(summary))
     if args.output_dir:
         recorder.save(args.output_dir, summary)

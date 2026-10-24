@@ -102,6 +102,9 @@ def main(argv=None):
         parser.error("--check-observations only allows --source ros-readonly.")
     try:
         client_example.validate_execution_args(args)
+        if args.record_parquet:
+            # Before the observation check and the model load (run() opens the recording again).
+            client_example.ParquetDatasetRecorder(args.record_parquet, fps=args.fps)
     except ValueError as exc:
         parser.error(str(exc))
     if args.execute:
