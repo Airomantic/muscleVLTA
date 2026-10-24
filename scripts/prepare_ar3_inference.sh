@@ -17,8 +17,14 @@ ARM_INTERFACE="${INFER_ARM_INTERFACE:-enp132s0}"
 ARM_CIDR="${INFER_ARM_CIDR:-192.168.0.100/24}"
 ARM_IP="${INFER_ARM_IP:-192.168.0.160}"
 ARM_LOCAL_IP="${ARM_CIDR%/*}"
+# The gripper has its own wired subnet; Puppetry's 192.168.2.240 is the exoskeleton.
+GRIPPER_INTERFACE="${INFER_GRIPPER_INTERFACE:-$ARM_INTERFACE}"
+GRIPPER_CIDR="${INFER_GRIPPER_CIDR:-192.168.127.100/24}"
+GRIPPER_LOCAL_IP="${GRIPPER_CIDR%/*}"
 GRIPPER_HOST="${INFER_GRIPPER_HOST:-192.168.127.10}"
 GRIPPER_USER="${INFER_GRIPPER_USER:-cftc}"
+GRIPPER_CHANNEL="${INFER_GRIPPER_CHANNEL:-can0}"
+GRIPPER_MOTOR_ID="${INFER_GRIPPER_MOTOR_ID:-1}"
 FRONT_SERIAL="${INFER_FRONT_SERIAL:-CPC8563000HX}"
 WRIST_SERIAL="${INFER_WRIST_SERIAL:-CV2856D000BV}"
 TILT_ANGLE="${INFER_TILT_ANGLE:-40.0}"
@@ -32,6 +38,7 @@ export OPENPI_PORT="${OPENPI_PORT:-8000}"
 
 WITH_ARM=1 WITH_SSH=1 WITH_TACTILE=1 WITH_CAMERAS=1 WITH_TILT=1 WITH_POLICY=0
 WINDOWS=0 MODE=start TASK=""
+INITIALIZE_GRIPPER=0
 ORIGINAL_ARGS=("$@")
 
 info() { printf '[infer_oneclick] %s\n' "$*"; }
@@ -43,6 +50,9 @@ Usage: ./infer_oneclick.sh [OPTIONS]
   --dry-run          Print commands/dependencies; no device or network access.
   --check            Check local files/interpreters only; no device/network access.
   --checkpoint DIR   Checkpoint step directory (default: infer_checkpoint/29999).
+  --ready-only       Connect the gripper and recheck running services; no new tabs.
+  --initialize-gripper
+                     Allow gripper calibration if needed (MOVES the gripper).
   --no-ssh           Reuse remote services; still require both tactile ports and gRPC.
   --no-arm           Do not launch or check the arm.
   --no-tactile       Do not launch or check the local tactile ROS bridge.
@@ -57,16 +67,26 @@ Default: AR3 MoveIt, two SSH services, tactile bridge, front/wrist Orbbec RGB,
 40-degree tilt, and a separate readiness tab, ROS domain 111. Start local model
 inference with VS Code's infer_muscleVLTA_debug after preparation. --with-policy
 is the alternative WebSocket workflow; do not load a second model with F5.
-Arm bringup POWERS THE ARM; the tilt servo MOVES. No arm trajectory, gripper
-initialization, teleoperation, recording, or model action-execution client is run.
+Arm bringup POWERS THE ARM; the tilt servo MOVES. The readiness task connects the
+gripper's CAN interface if disconnected, preserving it for subsequent inference.
+Calibration requires --initialize-gripper. No arm trajectory, teleoperation,
+recording, or model action-execution client is run.
 Stop existing teleoperation/recording before starting. One owner per camera.
 
 Paths: INFER_AR3_WS, INFER_CAPTURE_DIR, INFER_GRIPPER_DIR, INFER_TILT_DIR,
 INFER_SERVO_PYTHON, INFER_ROS_SETUP, INFER_CAMERA_LAUNCH_DIR, INFER_TACTILE_CONFIG.
-Devices: INFER_ARM_INTERFACE, INFER_ARM_CIDR, INFER_ARM_IP, INFER_GRIPPER_HOST,
-INFER_GRIPPER_USER, INFER_FRONT_SERIAL, INFER_WRIST_SERIAL, INFER_TILT_ANGLE.
+Devices: INFER_ARM_INTERFACE, INFER_ARM_CIDR, INFER_ARM_IP, INFER_GRIPPER_INTERFACE,
+INFER_GRIPPER_CIDR, INFER_GRIPPER_HOST, INFER_GRIPPER_USER, INFER_FRONT_SERIAL,
+INFER_WRIST_SERIAL, INFER_TILT_ANGLE, INFER_GRIPPER_CHANNEL, INFER_GRIPPER_MOTOR_ID.
 Runtime: INFER_ROS_DOMAIN_ID, INFER_TIMEOUT, INFER_CHECKPOINT, OPENPI_SERVE_GPU,
 OPENPI_CONFIG_NAME, OPENPI_PYTHON, OPENPI_DATA_HOME, OPENPI_HOST, OPENPI_PORT.
+
+Before opening tabs, add the gripper's local wired address if missing (sudo may
+prompt): 192.168.127.100/24 on INFER_GRIPPER_INTERFACE (default: arm interface).
+Verify that 192.168.127.10 uses this interface/source address. Existing addresses
+are preserved; --no-arm and --no-ssh still prepare this network for gripper feedback.
+Tactile pc_host must match INFER_GRIPPER_CIDR's IP. Puppetry's 192.168.2.240 is the
+exoskeleton address, not the gripper. --check and --dry-run never change networking.
 
 SSH uses keys/agent or interactive authentication and VERIFIED known_hosts entries.
 If a host is new, verify its fingerprint with a separate ssh login first.
@@ -74,10 +94,11 @@ Ctrl+C stops a tab's foreground process; press Enter after exit to close the tab
 Remote deploy.sh may leave services running. Closing tabs is NOT an emergency
 stop and does not guarantee arm power-off or a physical stop.
 
-This prepares services only. Readiness requires fresh, connected, initialized
-gripper feedback, not just a responsive gRPC server. Read-only debug never
-connects/initializes the motor or commands robot motion. Prepare its connection
-through your approved driver; no teleop state owner is started here.
+Readiness requires fresh, connected, initialized gripper feedback, not just a
+responsive gRPC server. If the motor is uninitialized, clear the gripper workspace
+and rerun with --ready-only --initialize-gripper. Preparation leaves the server's
+CAN connection open; a hardware test or teleop exiting with Disconnect can undo it.
+Read-only F5 debug still never connects/initializes the motor or commands motion.
 EOF
 }
 
@@ -90,6 +111,8 @@ while (($#)); do
             [[ $# -ge 2 && -n "$2" ]] || die "--checkpoint requires a step directory."
             CHECKPOINT="$2"; shift ;;
         --no-ssh) WITH_SSH=0 ;;
+        --ready-only) TASK=ready ;;
+        --initialize-gripper) INITIALIZE_GRIPPER=1 ;;
         --no-arm) WITH_ARM=0 ;;
         --no-tactile) WITH_TACTILE=0 ;;
         --no-cameras) WITH_CAMERAS=0 ;;
@@ -107,6 +130,9 @@ while (($#)); do
 done
 [[ "$CHECKPOINT" == /* ]] || CHECKPOINT="$PWD/$CHECKPOINT"
 [[ "$WAIT_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "INFER_TIMEOUT must be a positive integer."
+[[ "$GRIPPER_MOTOR_ID" =~ ^[0-9]+$ && ${#GRIPPER_MOTOR_ID} -le 3 ]] \
+    && ((10#$GRIPPER_MOTOR_ID >= 1 && 10#$GRIPPER_MOTOR_ID <= 255)) \
+    || die "INFER_GRIPPER_MOTOR_ID must be 1..255."
 [[ "$ROS_DOMAIN_ID" =~ ^[0-9]+$ && ${#ROS_DOMAIN_ID} -le 3 ]] \
     && ((10#$ROS_DOMAIN_ID <= 232)) || die "INFER_ROS_DOMAIN_ID must be 0..232."
 [[ "$OPENPI_PORT" =~ ^[0-9]+$ && ${#OPENPI_PORT} -le 5 ]] \
@@ -190,16 +216,26 @@ gripper_feedback_ready() {
     env -u PYTHONPATH -u PYTHONHOME -u LD_LIBRARY_PATH \
         "$GRIPPER_DIR/.venv-ros/bin/python" "$ROOT/scripts/ar3_ros_observation_worker.py" \
         --check-gripper --gripper-address "$GRIPPER_HOST:50008" --timeout "$WAIT_TIMEOUT" \
-        || die "Gripper feedback is not ready. Prepare the motor through your approved driver; no motor commands were sent."
+        || die "Gripper feedback is not ready. Check the preparation output and whether another client disconnected the motor."
+}
+
+prepare_gripper_feedback() {
+    local args=(--connect --gripper-address "$GRIPPER_HOST:50008"
+        --channel "$GRIPPER_CHANNEL" --motor-id "$GRIPPER_MOTOR_ID" --timeout "$WAIT_TIMEOUT")
+    ((INITIALIZE_GRIPPER)) && args+=(--initialize)
+    env -u PYTHONPATH -u PYTHONHOME -u LD_LIBRARY_PATH \
+        "$GRIPPER_DIR/.venv-ros/bin/python" "$ROOT/scripts/prepare_ar3_gripper.py" "${args[@]}" \
+        || die "Gripper preparation failed; inspect its CAN/status error above. If calibration is required, use --ready-only --initialize-gripper (moves the gripper)."
 }
 
 preflight() {
     local cmd path
-    for cmd in bash env timeout awk ssh flock mktemp jq; do
+    for cmd in bash env timeout awk ssh flock mktemp jq ip sudo; do
         command -v "$cmd" >/dev/null || die "Missing command: $cmd"
     done
+    [[ -d "/sys/class/net/$GRIPPER_INTERFACE" ]] || die "Missing gripper interface: $GRIPPER_INTERFACE"
     local files=("$ROS_SETUP" "$CAPTURE_DIR/scripts/ar3_gripper_connection.py"
-        "$ROOT/scripts/ar3_ros_observation_worker.py")
+        "$ROOT/scripts/ar3_ros_observation_worker.py" "$ROOT/scripts/prepare_ar3_gripper.py")
     local executables=("$GRIPPER_DIR/.venv-ros/bin/python")
     [[ -d "$GRIPPER_DIR" ]] || die "Missing gripper project: $GRIPPER_DIR"
     if ((WITH_ARM)); then
@@ -245,6 +281,9 @@ preflight() {
             any(.sensors[]; .name == "sensor_0" and .remote_addr == ($host + ":50051") and .enable_force == true) and
             any(.sensors[]; .name == "sensor_2" and .remote_addr == ($host + ":50052") and .enable_force == true)
         ' "$TACTILE_CONFIG" >/dev/null || die "Tactile config must match both force-enabled sensors at $GRIPPER_HOST."
+        jq -e --arg host "$GRIPPER_LOCAL_IP" 'all(.sensors[]; .pc_host == $host)' \
+            "$TACTILE_CONFIG" >/dev/null \
+            || die "Tactile return address must match $GRIPPER_LOCAL_IP; align pc_host with INFER_GRIPPER_CIDR."
         local sdk_python sdk_dir
         sdk_python=$(jq -r --arg fallback "$(dirname -- "$CAPTURE_DIR")/V3_Gripper/.venv/bin/python" \
             '.sdk_python // $fallback' "$TACTILE_CONFIG")
@@ -258,13 +297,22 @@ preflight() {
 
 print_plan() {
     info "Domain=$ROS_DOMAIN_ID; checkpoint=$CHECKPOINT; GPU=$OPENPI_SERVE_GPU"
-    info "Arm bringup powers the arm; tilt moves to $TILT_ANGLE degrees. NO model actions are executed."
+    if [[ "$TASK" == ready ]]; then
+        info "Recheck existing services; require gripper $GRIPPER_HOST via $GRIPPER_INTERFACE src $GRIPPER_LOCAL_IP. No new tabs."
+    else
+        info "Arm bringup powers the arm; tilt moves to $TILT_ANGLE degrees. NO model actions are executed."
+        info "Before tabs: add $GRIPPER_CIDR to $GRIPPER_INTERFACE only if absent; require gripper $GRIPPER_HOST via this interface with source $GRIPPER_LOCAL_IP."
+    fi
+    ((INITIALIZE_GRIPPER)) && info "Gripper calibration is enabled if needed; this MOVES the gripper."
     local task
-    for task in "${TASKS[@]}"; do
+    local planned_tasks=("${TASKS[@]}")
+    [[ -z "$TASK" ]] || planned_tasks=("$TASK")
+    for task in "${planned_tasks[@]}"; do
         command_for "$task"
         printf '\n[%s] cwd=%s\n' "$task" "$TASK_CWD"
         if [[ "$task" == ready ]]; then
-            printf '  Require GetAllState on %s:50008 AND fresh, connected, initialized motor feedback (no Connect/Initialize/Move RPC).\n' "$GRIPPER_HOST"
+            printf '  Connect CAN %s motor %s at %s:50008 if disconnected; retain the connection for inference.\n' "$GRIPPER_CHANNEL" "$GRIPPER_MOTOR_ID" "$GRIPPER_HOST"
+            printf '  Require fresh, connected, initialized motor feedback; calibration only with the explicit flag.\n'
             ((WITH_ARM)) && printf '  Wait for /joint_states and /position_joint_trajectory_controller/controller_state.\n'
             ((WITH_TACTILE)) && printf '  Wait for sensor_0/sensor_2 depth and wrench samples.\n'
             ((WITH_CAMERAS)) && printf '  Wait for /front/color/image_raw and /wrist/color/image_raw samples.\n'
@@ -307,8 +355,7 @@ check_conflicts() {
     local nodes
     nodes=$(timeout --kill-after=3 15 "${ROS_CMD[@]}" ros2 node list --no-daemon) \
         || die "Cannot inspect ROS nodes; no tasks started."
-    [[ "$nodes" != *ar3r_cartesian_retargeting* && "$nodes" != *gripper_teleop* ]] \
-        || die "Teleoperation is running. Stop it before inference preparation."
+    reject_teleoperation "$nodes"
     if ((WITH_ARM)) && [[ "$nodes" == *controller_manager* ]]; then
         die "A controller manager already exists; inspect it and use --no-arm to preserve it."
     fi
@@ -326,8 +373,37 @@ check_conflicts() {
     fi
 }
 
+reject_teleoperation() {
+    [[ "$1" != *ar3r_cartesian_retargeting* && "$1" != *gripper_teleop* ]] \
+        || die "Teleoperation is running. Stop it before inference preparation."
+    [[ "$1" != *openpi_ar3_control_* ]] \
+        || die "Live inference is running. Stop it before gripper preparation."
+}
+
+check_gripper_route() {
+    local route
+    route=$(ip -4 route get "$GRIPPER_HOST") || die "Cannot resolve route to gripper $GRIPPER_HOST."
+    [[ " $route " == *" dev $GRIPPER_INTERFACE "* && " $route " == *" src $GRIPPER_LOCAL_IP "* ]] \
+        || die "Unexpected gripper route: $route. Expected dev $GRIPPER_INTERFACE src $GRIPPER_LOCAL_IP; run ./infer_oneclick.sh to prepare the wired network."
+}
+
+prepare_gripper_network() {
+    local addresses
+    addresses=$(ip -o -4 addr show dev "$GRIPPER_INTERFACE")
+    if ! awk -v cidr="$GRIPPER_CIDR" '$4 == cidr {found=1} END {exit !found}' <<<"$addresses"; then
+        info "Adding gripper wired address $GRIPPER_CIDR to $GRIPPER_INTERFACE; enter the local sudo password if prompted."
+        sudo ip addr add "$GRIPPER_CIDR" dev "$GRIPPER_INTERFACE" \
+            || die "Could not add gripper wired address $GRIPPER_CIDR; no tasks started."
+    fi
+    check_gripper_route
+    info "Gripper route ready: $GRIPPER_HOST via $GRIPPER_INTERFACE src $GRIPPER_LOCAL_IP."
+}
+
 run_task() {
-    local addresses route pc_host deadline
+    local addresses route pc_host deadline nodes
+    case "$TASK" in
+        sensor|gripper|tactile|ready) check_gripper_route ;;
+    esac
     case "$TASK" in
         arm)
             addresses=$(ip -o -4 addr show dev "$ARM_INTERFACE")
@@ -360,7 +436,11 @@ run_task() {
                 done < <(jq -r '.sensors[].pc_host' "$TACTILE_CONFIG")
             fi ;;
         ready)
+            nodes=$(timeout --kill-after=3 15 "${ROS_CMD[@]}" ros2 node list --no-daemon) \
+                || die "Cannot inspect ROS nodes; gripper preparation was not attempted."
+            reject_teleoperation "$nodes"
             wait_tcp 50051; wait_tcp 50052; grpc_ready
+            prepare_gripper_feedback
             if ((WITH_ARM)); then
                 wait_topic /joint_states sensor_msgs/msg/JointState --field header
                 wait_topic /position_joint_trajectory_controller/controller_state control_msgs/msg/JointTrajectoryControllerState --field header
@@ -391,7 +471,7 @@ run_task() {
                 done
             fi
             info "PREPARATION READY for the selected services. No policy actions were sent."
-            info "Gripper feedback is valid and fresh; the motor was NOT connected/initialized by this launcher."
+            info "Gripper feedback is valid and fresh; its CAN connection is retained for inference."
             info "Start infer_muscleVLTA_debug for real-observation prediction only; no hardware execution."
             return ;;
     esac
@@ -424,6 +504,7 @@ if [[ "$MODE" == dry-run ]]; then print_plan; exit 0; fi
 if [[ "$MODE" == check ]]; then preflight; exit 0; fi
 
 if [[ -n "$TASK" ]]; then
+    [[ "$TASK" != ready ]] || preflight
     command_for "$TASK"
     state_root="${XDG_RUNTIME_DIR:-/tmp}/musclevlta-infer-$UID-$ROS_DOMAIN_ID"
     umask 077
@@ -445,6 +526,7 @@ preflight
 command -v gnome-terminal >/dev/null || die "Missing gnome-terminal; use --dry-run to launch tasks manually."
 [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] || die "No graphical session; use --dry-run."
 check_conflicts
+prepare_gripper_network
 print_plan
 option=--window
 for task in "${TASKS[@]}"; do
