@@ -239,7 +239,8 @@ does not start a policy server, leaving GPU memory available for local debugging
 
 The original **`infer_muscleVLTA_debug`** remains prediction-only. The separate VS Code configuration
 **`infer_muscleVLTA_LIVE (MOVES ARM + GRIPPER)`** uses `--source ros --execute` and will send real targets
-(**`infer_muscleVLTA_LIVE_fineTuning (MOVES ARM + GRIPPER)`** does the same with the full fine-tuned checkpoint).
+(**`infer_muscleVLTA_LIVE_fineTuning (MOVES ARM + GRIPPER)`** does the same with the full fine-tuned checkpoint;
+its `_recordParquet` variant also records every run, see [Recording LIVE runs](#recording-live-runs-parquet)).
 Stop the read-only model first to free its GPU memory. Only start LIVE with a clear workspace, a verified
 starting pose and checkpoint/action units, no teleoperation/replay/MoveIt goal, and an accessible physical
 emergency stop. Do not attach a debugger to the independent control worker.
@@ -275,6 +276,36 @@ exit. Motor calibration additionally requires `--initialize-gripper` (not enable
 it can cause full-stroke motion. Changing the force or position predictions in LIVE controls the actual
 gripper; unlike read-only mode, acknowledged force commands become the next observation's force setting.
 Ctrl+C/EOF or the step budget ends the run with a stop request. Closing only Rerun does not stop control.
+
+##### Recording LIVE runs (parquet)
+
+**`infer_muscleVLTA_LIVE_fineTuning_recordParquet (MOVES ARM + GRIPPER)`** is the LIVE fine-tuning configuration
+(same checkpoint and limits; it moves the robot) with the training prompt and
+`--record-parquet ${workspaceFolder}/dataRecordParquet`. Each run with executed steps appends one episode to a LeRobot
+v3.0 dataset laid out like the training data (`meta/info.json`, `meta/tasks.parquet`, `meta/episodes/`,
+`meta/stats.json`, one `data/chunk-000/file-XXX.parquet` per episode), so inference can be compared with the
+demonstrations. One row per executed control step:
+
+| Column | Shape | Content |
+| --- | --- | --- |
+| `observation.state` | (8,) | 7 joint positions [rad] + gripper position (0..1000), measured before the step's action; `observation.state[:8]` of the training data |
+| `observation.arm_effort` | (7,) | measured joint torques [Nm] |
+| `action` | (9,) | target applied by the control worker: joints after its step / velocity limits, gripper position and force level clipped to the SDK ranges |
+| `policy.action` | (9,) | raw policy prediction in the same layout; it differs from `action` where the limits held the arm back |
+| `policy.chunk_step` | scalar | step within the action chunk (0: VLM replan) |
+| `sync.control_time_s` | scalar | wall-clock time since the episode start [s]; `timestamp` is the nominal `frame_index / fps` |
+
+Camera videos, finger wrenches and tactile depth are not recorded. The episode rows in `meta/episodes/` add
+`inference/*` columns: config, mode, reactive `k`, CLI arguments (JSON), start time and outcome (`completed`,
+`interrupted` or the error).
+
+The episode is written when the run ends: at the step budget, after an error, on Ctrl+C, or on the first VS Code
+**Stop** (`"onTerminate": "KeyboardInterrupt"` turns it into Ctrl+C, so the stop request and the save still run).
+Wait for the `Recorded episode ...` log line: a second Stop kills the process at once and loses an unsaved episode.
+Before any motion, the run refuses a directory it cannot append to: a training dataset, a recording with other
+columns or fps, or another non-empty directory; choose another directory then. `dataRecordParquet/` is gitignored.
+Read it with `pandas.read_parquet("dataRecordParquet/data")` (episodes: `dataRecordParquet/meta/episodes`) or with
+`openpi.data.lerobot_v3.LeRobotV3Dataset`. Recording needs pyarrow and pandas (both in the openpi environment).
 
 ##### WebSocket serving and replay
 
@@ -347,17 +378,20 @@ The summary reports the inference latency and the errors against the recorded ac
 - joint MAE for each step of the chunk
 
 `--output-dir` writes `rollout.npz` (state and policy / executed / recorded actions for each step) and
-`summary.json`.
+`summary.json`. `--record-parquet DIR` also appends the run to an inference dataset (see
+[Recording LIVE runs](#recording-live-runs-parquet)).
 
 The `.rrd` file uses the panels of the dataset viewer: cameras, gripper, force level, state / action, arm effort,
 finger wrenches and tactile depth. It adds the policy actions, a "policy vs recorded" tab for each joint and the
-inference latency. Open it with the same rerun version that wrote it (`uvx --from rerun-sdk==0.23.1 rerun
-replay/episode_16.rrd`). You can also stream to a running viewer with `--rerun rerun+http://HOST:9876/proxy`, or open
-one with `--rerun spawn`.
+inference latency. Only dataset replay has recorded actions: with live or fake observations, the "action (recorded)"
+panel is omitted and the tab compares the policy with the measured state ("policy vs measured state", or
+"predictions vs measured state" in read-only mode). Open it with the same rerun version that wrote it
+(`uvx --from rerun-sdk==0.23.1 rerun replay/episode_16.rrd`). You can also stream to a running viewer with
+`--rerun rerun+http://HOST:9876/proxy`, or open one with `--rerun spawn`.
 
 On the robot PC, install the client with `pip install --no-deps -e packages/openpi-client` plus `msgpack websockets
-pillow dm-tree typing_extensions`. This avoids downgrading numpy in an existing numpy 2 environment, because
-openpi-client pins `numpy<2`.
+pillow dm-tree typing_extensions` (and `pyarrow pandas` for `--record-parquet`). This avoids downgrading numpy in an
+existing numpy 2 environment, because openpi-client pins `numpy<2`.
 
 ## 🔄 Online DAgger Launchers
 
