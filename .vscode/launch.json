@@ -145,7 +145,53 @@
                 "--gpu", "0",
                 "--source", "ros",
                 "--execute",
-                "--prompt", "Unplug the white charging plug from the white socket and place it on the table",
+                "--prompt", "Unplug the white charging plug from the white socket and place it on the table, don't bump your fingers into other objects",
+                "--mode", "reactive",
+                "--fps", "15",
+                "--max-steps", "300",
+                "--max-joint-step", "0.03",
+                "--max-joint-velocity", "0.1",
+                "--max-target-deviation", "0.25",
+                "--command-timeout", "0.5",
+                "--gripper-speed", "10",
+                "--ros-domain-id", "111",
+                "--front-topic", "/front/color/image_raw",
+                "--wrist-topic", "/wrist/color/image_raw",
+                "--joint-topic", "/joint_states",
+                "--tactile-prefix", "/v3_gripper/tactile",
+                "--gripper-address", "192.168.127.10:50008",
+                "--force-level", "80",
+                "--observation-max-age", "0.5",                                                                                                                                                                                            
+                "--observation-timeout", "10",
+                "--rerun", "spawn",
+                "--output-dir", "${workspaceFolder}/outputs/infer_muscleVLTA_live_fineTuning"
+            ]
+        },
+        {
+            "name": "infer_muscleVLTA_LIVE_fineTuning_recordParquet (MOVES ARM + GRIPPER)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "program": "${workspaceFolder}/scripts/infer_musclevlta_debug.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": false,
+            "onTerminate": "KeyboardInterrupt",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src:${workspaceFolder}/packages/openpi-client/src",
+                "PYTHONUNBUFFERED": "1",
+                "LD_LIBRARY_PATH": "",
+                "ROS_DOMAIN_ID": "111",
+                "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+            },
+            "args": [
+                "--checkpoint-dir", "${workspaceFolder}/infer_checkpoint/23000",
+                "--config-name", "pi05_ar3_force_visuotactile_reactive",
+                "--gpu", "0",
+                "--source", "ros",
+                "--execute",
+                "--prompt", "Unplug the white charging plug from the white socket and place it on the table, don't bump your fingers into other objects",
                 "--mode", "reactive",
                 "--fps", "15",
                 "--max-steps", "300",
@@ -164,7 +210,8 @@
                 "--observation-max-age", "0.5",
                 "--observation-timeout", "10",
                 "--rerun", "spawn",
-                "--output-dir", "${workspaceFolder}/outputs/infer_muscleVLTA_live_fineTuning"
+                "--output-dir", "${workspaceFolder}/outputs/infer_muscleVLTA_live_fineTuning_recordParquet",
+                "--record-parquet", "${workspaceFolder}/dataRecordParquet"
             ]
         }
     ]
