@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import cv2
 import numpy as np
 from openpi_client import msgpack_numpy
+import pyarrow.parquet as pq
 import pytest
 
 from openpi.data import lerobot_v3
@@ -88,7 +89,8 @@ def test_client_layout_matches_policy_transforms():
     assert client_example.FORCE_LEVEL_RANGE == ar3.FORCE_LEVEL_RANGE
     assert (client_example.STATE_DIM, client_example.ACTION_DIM) == (ar3.STATE_DIM, ar3.ACTION_DIM)
     assert client_example.FORCE_LEVEL_INDEX == ar3.FORCE_LEVEL_ACTION_INDEX
-    assert ar3.ACTION_NAMES[client_example.GRIPPER_INDEX] == "gripper.position_sdk"
+    assert (client_example.STATE_NAMES, client_example.ACTION_NAMES) == (ar3.STATE_NAMES, ar3.ACTION_NAMES)
+    assert client_example.ACTION_NAMES[client_example.GRIPPER_INDEX] == "gripper.position_sdk"
 
 
 def test_readonly_source_uses_real_worker_without_motion_api(monkeypatch):
@@ -442,6 +444,78 @@ def test_rerun_logger_writes_a_recording(tmp_path):
             "/inference/round_trip_ms",
         ):
             assert entity in entities
+
+
+@pytest.mark.parametrize("recorded", [True, False])
+def test_rerun_shows_recorded_actions_only_for_sources_with_recordings(recorded):
+    rrb = pytest.importorskip("rerun.blueprint")
+    names, stack = set(), [client_example.RerunLogger.blueprint(rrb, recorded=recorded).root_container]
+    while stack:
+        item = stack.pop()
+        names.add(item.name)
+        if isinstance(item, rrb.Container):
+            stack.extend(item.contents)
+    assert "action (policy)" in names
+    # Live sources have no recorded (teleoperation) actions: no empty "action (recorded)" panel.
+    assert ("action (recorded)" in names) == recorded
+    assert ("policy vs recorded" in names) == recorded
+    assert ("policy vs measured state" in names) != recorded
+
+
+def test_record_parquet_appends_inference_episodes_without_videos_or_tactile(monkeypatch, tmp_path):
+    policy = FakeReactivePolicy(action_horizon=4)
+    metadata = {"config_name": "fake", "action_horizon": 4, "reactive": True, "cross_attention_latency": 1}
+    metadata["tactile_shape"] = list(TACTILE_SHAPE)
+    monkeypatch.setattr(
+        client_example.websocket_client_policy,
+        "WebsocketClientPolicy",
+        lambda host, port: InProcessClient(policy, metadata),
+    )
+    root = tmp_path / "dataRecordParquet"
+    # A tiny joint step limit, so that executed and predicted joint targets differ.
+    argv = ["--source", "fake", "--fps", "0", "--max-joint-step", "0.0005", "--record-parquet", str(root)]
+    summary = client_example.main([*argv, "--max-steps", "5"])
+    assert summary["record_parquet"] == {"root": str(root), "episode_index": 0, "frames": 5, "outcome": "completed"}
+
+    class InterruptedRobot(client_example.FakeAR3Robot):
+        observations = 0
+
+        def observe(self):
+            self.observations += 1
+            if self.observations > 3:
+                raise KeyboardInterrupt  # Ctrl+C, or VS Code Stop with "onTerminate": "KeyboardInterrupt"
+            return super().observe()
+
+    monkeypatch.setattr(client_example, "make_robot", lambda args, metadata: InterruptedRobot())
+    summary = client_example.main([*argv, "--prompt", "other task"])
+    assert summary["record_parquet"] == {"root": str(root), "episode_index": 1, "frames": 3, "outcome": "interrupted"}
+
+    meta = lerobot_v3.LeRobotV3Metadata(root)
+    assert (meta.fps, meta.info["total_episodes"], meta.info["total_frames"]) == (15.0, 2, 8)
+    assert meta.tasks == {0: client_example.PROMPT, 1: "other task"}
+    assert not [key for key in meta.features if any(word in key for word in ("image", "wrench", "tactile"))]
+    assert [meta.episodes[index]["inference/outcome"] for index in (0, 1)] == ["completed", "interrupted"]
+    assert json.loads(meta.episodes[1]["inference/args"])["max_joint_step"] == 0.0005
+    dataset = lerobot_v3.LeRobotV3Dataset(root)
+    assert (len(dataset), dataset.episode_bounds(1)) == (8, (5, 8))
+    item = dataset[6]
+    assert (item["task"], int(item["frame_index"]), int(item["index"])) == ("other task", 1, 6)
+    assert json.loads((root / "meta/stats.json").read_text())["action"]["count"] == [8]
+
+    table = pq.read_table(meta.data_file(0))
+    state, action, predicted = (
+        lerobot_v3.column_to_numpy(table.column(key)) for key in ("observation.state", "action", "policy.action")
+    )
+    np.testing.assert_array_equal(lerobot_v3.column_to_numpy(table.column("policy.chunk_step")), [0, 1, 2, 3, 0])
+    # The state is measured before the executed action of the step (the fake robot reaches its targets).
+    np.testing.assert_array_equal(state[1:], action[:-1, :8])
+    assert np.all(np.abs(action[:, :7] - state[:, :7]) <= 0.0005 + 1e-7)
+    assert np.any(predicted[:, :7] != action[:, :7])
+
+    # Training datasets, other fps and unrelated non-empty directories are never appended to.
+    for directory, fps in ((DATASET, 15), (root, 10), (tmp_path, 15)):
+        with pytest.raises(ValueError, match="choose another directory"):
+            client_example.ParquetDatasetRecorder(directory, fps=fps)
 
 
 def test_main_replays_a_dataset_episode_with_outputs(monkeypatch, tmp_path, tactile_cache_dir):

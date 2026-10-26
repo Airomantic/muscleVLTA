@@ -58,7 +58,9 @@ def environment(tmp_path):
         gripper / ".venv-ros/bin/python",
         """#!/bin/bash
 printf 'grpc %s\\n' "$*" >> "$INFER_TEST_CALLS"
-if [[ " $* " == *" --check-gripper "* ]]; then
+if [[ "$1" == */prepare_ar3_gripper.py ]]; then
+    exit "${INFER_TEST_GRIPPER_PREPARE_EXIT:-0}"
+elif [[ " $* " == *" --check-gripper "* ]]; then
     exit "${INFER_TEST_GRIPPER_FEEDBACK_EXIT:-0}"
 fi
 """,
@@ -85,8 +87,32 @@ fi
     setup = base / "setup.bash"
     setup.write_text("")
     mock_bin = base / "bin"
-    for name in ("ssh", "ip", "ping", "sudo", "curl"):
+    for name in ("ssh", "ping", "curl"):
         _executable(mock_bin / name, '#!/bin/bash\nprintf "%s\\n" "$0 $*" >> "$INFER_TEST_CALLS"\n')
+    _executable(
+        mock_bin / "ip",
+        """#!/bin/bash
+printf 'ip %s\\n' "$*" >> "$INFER_TEST_CALLS"
+[[ "${1:-}" != -4 ]] || shift
+if [[ "$*" == *"addr show"* ]]; then
+    if [[ "${INFER_TEST_GRIPPER_ADDRESS_PRESENT:-1}" == 1 || -f "$INFER_TEST_IP_ADDED" ]]; then
+        printf '1: %s inet %s scope global\\n' "${INFER_GRIPPER_INTERFACE:-lo}" "${INFER_GRIPPER_CIDR:-192.168.127.100/24}"
+    fi
+elif [[ "$1 $2" == "route get" ]]; then
+    printf '%s dev %s src %s\\n' "$3" "${INFER_TEST_ROUTE_INTERFACE:-lo}" "${INFER_TEST_ROUTE_SOURCE:-192.168.127.100}"
+elif [[ "$1 $2" == "addr add" ]]; then
+    touch "$INFER_TEST_IP_ADDED"
+fi
+""",
+    )
+    _executable(
+        mock_bin / "sudo",
+        """#!/bin/bash
+printf 'sudo %s\\n' "$*" >> "$INFER_TEST_CALLS"
+[[ "$1 $2 $3" == "ip addr add" ]] || exit 1
+exec "$@"
+""",
+    )
     _executable(
         mock_bin / "timeout",
         """#!/bin/bash
@@ -136,6 +162,7 @@ printf '\\n' >> "$INFER_TEST_CALLS"
             "INFER_ARM_INTERFACE": "lo",
             "INFER_CHECKPOINT": str(checkpoint),
             "INFER_TEST_CALLS": str(tmp_path / "calls"),
+            "INFER_TEST_IP_ADDED": str(tmp_path / "gripper-address-added"),
             "INFER_TEST_PYTHON": sys.executable,
             "OPENPI_DATA_HOME": str(data_home),
             "OPENPI_PYTHON": sys.executable,
@@ -172,6 +199,8 @@ def test_default_plan_is_hardware_prep_not_teleoperation_or_model_execution(envi
     assert "--execute" not in result.stdout
     assert "--initialize" not in result.stdout
     assert "ar3_gripper_teleop" not in result.stdout
+    assert "192.168.127.100/24" in result.stdout
+    assert "192.168.127.10" in result.stdout
     assert not Path(environment["INFER_TEST_CALLS"]).exists()
 
 
@@ -195,6 +224,26 @@ def test_check_rejects_tactile_host_mismatch(environment):
     result = run(environment, "--check")
     assert result.returncode != 0
     assert "Tactile config must match" in result.stderr
+
+
+def test_check_rejects_tactile_return_address_mismatch(environment):
+    config_path = Path(environment["INFER_TACTILE_CONFIG"])
+    config = json.loads(config_path.read_text())
+    config["sensors"][1]["pc_host"] = "192.168.2.100"
+    config_path.write_text(json.dumps(config))
+    result = run(environment, "--check")
+    assert result.returncode != 0
+    assert "Tactile" in result.stderr
+    assert "192.168.127.100" in result.stderr
+    assert not Path(environment["INFER_TEST_CALLS"]).exists()
+
+
+def test_check_requires_gripper_interface_even_without_arm(environment):
+    environment["INFER_GRIPPER_INTERFACE"] = "infer-no-such-nic"
+    result = run(environment, "--check", "--no-arm")
+    assert result.returncode != 0
+    assert "gripper interface" in result.stderr.lower()
+    assert not Path(environment["INFER_TEST_CALLS"]).exists()
 
 
 @pytest.mark.parametrize("value", ["-1", "61", "nan", "40;touch /tmp/unwanted"])
@@ -233,12 +282,66 @@ def test_terminal_children_receive_absolute_checkpoint(environment, tmp_path):
     assert not any("GetAllState" in line for line in calls)
 
 
+@pytest.mark.parametrize("args", [(), ("--no-arm",)])
+def test_missing_gripper_address_is_added_before_any_terminal(environment, args):
+    environment["INFER_TEST_GRIPPER_ADDRESS_PRESENT"] = "0"
+    result = run(environment, *args)
+    assert result.returncode == 0, result.stderr
+    calls = Path(environment["INFER_TEST_CALLS"]).read_text().splitlines()
+    add_index = calls.index("sudo ip addr add 192.168.127.100/24 dev lo")
+    route_index = calls.index("ip -4 route get 192.168.127.10")
+    terminal_indices = [i for i, line in enumerate(calls) if line.startswith("terminal ")]
+    assert terminal_indices
+    assert add_index < route_index < min(terminal_indices)
+    assert Path(environment["INFER_TEST_IP_ADDED"]).exists()
+    assert sum(line.startswith("sudo ") for line in calls) == 1
+    if "--no-arm" in args:
+        for index in terminal_indices:
+            terminal_args = shlex.split(calls[index].removeprefix("terminal "))
+            assert terminal_args[terminal_args.index("--task") + 1] != "arm"
+
+
+def test_existing_gripper_address_needs_no_sudo(environment):
+    result = run(environment)
+    assert result.returncode == 0, result.stderr
+    calls = Path(environment["INFER_TEST_CALLS"]).read_text().splitlines()
+    assert "ip -4 route get 192.168.127.10" in calls
+    assert any(line.startswith("terminal ") for line in calls)
+    assert not any(line.startswith("sudo ") for line in calls)
+    assert not Path(environment["INFER_TEST_IP_ADDED"]).exists()
+
+
+@pytest.mark.parametrize(
+    "args", [(), ("--task", "sensor"), ("--task", "gripper"), ("--task", "tactile"), ("--task", "ready")]
+)
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [("INFER_TEST_ROUTE_INTERFACE", "wlan0"), ("INFER_TEST_ROUTE_SOURCE", "192.168.2.100")],
+)
+def test_wrong_gripper_route_fails_before_remote_access_or_terminals(environment, args, variable, value):
+    environment[variable] = value
+    result = run(environment, *args)
+    assert result.returncode != 0
+    assert "route" in result.stderr.lower()
+    assert "192.168.127.10" in result.stderr
+    calls = Path(environment["INFER_TEST_CALLS"]).read_text()
+    assert "ip -4 route get 192.168.127.10" in calls
+    assert "/dev/tcp/" not in calls
+    assert "/ssh " not in calls
+    assert "grpc " not in calls
+    assert "terminal " not in calls
+    assert "sudo " not in calls
+
+
 def test_existing_teleop_blocks_startup_before_any_terminal(environment):
     environment["INFER_TEST_NODES"] = "/ar3r_cartesian_retargeting"
     result = run(environment)
     assert result.returncode != 0
     assert "Teleoperation is running" in result.stderr
-    assert "terminal " not in Path(environment["INFER_TEST_CALLS"]).read_text()
+    calls = Path(environment["INFER_TEST_CALLS"]).read_text()
+    assert "terminal " not in calls
+    assert "ip " not in calls
+    assert "sudo " not in calls
 
 
 def test_readiness_requires_measured_tilt_and_both_wrenches(environment):
@@ -251,6 +354,133 @@ def test_readiness_requires_measured_tilt_and_both_wrenches(environment):
     assert "grpc" in calls
     assert "--check-gripper --gripper-address 192.168.127.10:50008" in calls
     assert "PREPARATION READY" in result.stdout
+
+
+def test_readiness_connects_motor_before_ros_inputs_and_keeps_final_readonly_check(environment):
+    result = run(environment, "--task", "ready")
+    assert result.returncode == 0, result.stderr
+    calls = Path(environment["INFER_TEST_CALLS"]).read_text().splitlines()
+    server_index = next(i for i, line in enumerate(calls) if "wait_for_gripper_server" in line)
+    prepare_index = next(i for i, line in enumerate(calls) if "prepare_ar3_gripper.py" in line)
+    topic_indices = [i for i, line in enumerate(calls) if "topic echo" in line]
+    feedback_index = next(i for i, line in enumerate(calls) if "--check-gripper" in line)
+    assert topic_indices
+    assert server_index < prepare_index < min(topic_indices)
+    assert max(topic_indices) < feedback_index
+    assert "--connect" in calls[prepare_index]
+    assert "--gripper-address 192.168.127.10:50008" in calls[prepare_index]
+    assert "--channel can0" in calls[prepare_index]
+    assert "--motor-id 1" in calls[prepare_index]
+    assert "--timeout 180" in calls[prepare_index]
+    assert "--initialize" not in "\n".join(calls)
+    assert "--execute" not in "\n".join(calls)
+
+
+def test_explicit_gripper_initialization_only_reaches_preparation_helper(environment):
+    result = run(environment, "--ready-only", "--initialize-gripper")
+    assert result.returncode == 0, result.stderr
+    calls = Path(environment["INFER_TEST_CALLS"]).read_text().splitlines()
+    prepare = next(line for line in calls if "prepare_ar3_gripper.py" in line)
+    feedback = next(line for line in calls if "--check-gripper" in line)
+    assert "--connect" in prepare
+    assert "--initialize" in shlex.split(prepare)
+    assert "--initialize" not in feedback
+    assert "--execute" not in "\n".join(calls)
+    assert "terminal " not in "\n".join(calls)
+
+
+def test_failed_gripper_preparation_stops_before_ros_inputs_or_final_readiness(environment):
+    environment["INFER_TEST_GRIPPER_PREPARE_EXIT"] = "1"
+    result = run(environment, "--ready-only")
+    assert result.returncode != 0
+    assert "PREPARATION READY" not in result.stdout
+    calls = Path(environment["INFER_TEST_CALLS"]).read_text()
+    assert "wait_for_gripper_server" in calls
+    assert "prepare_ar3_gripper.py" in calls
+    assert "topic echo" not in calls
+    assert "--check-gripper" not in calls
+    assert "terminal " not in calls
+
+
+def test_ready_only_reuses_running_controller_and_cameras_without_opening_terminals(environment):
+    environment["INFER_TEST_NODES"] = (
+        "/controller_manager\n/position_joint_trajectory_controller\n/front/camera\n/wrist/camera"
+    )
+    result = run(environment, "--ready-only")
+    assert result.returncode == 0, result.stderr
+    calls = Path(environment["INFER_TEST_CALLS"]).read_text()
+    assert "node list" in calls
+    assert "prepare_ar3_gripper.py" in calls
+    assert "--check-gripper" in calls
+    assert "terminal " not in calls
+    assert "/ssh " not in calls
+    assert "PREPARATION READY" in result.stdout
+
+
+def test_ready_only_dry_run_describes_only_readiness_without_device_access(environment):
+    result = run(environment, "--ready-only", "--dry-run")
+    assert result.returncode == 0, result.stderr
+    assert "[ready] cwd=" in result.stdout
+    for task in ("arm", "sensor", "gripper", "tactile", "front", "wrist", "tilt", "policy"):
+        assert f"[{task}] cwd=" not in result.stdout
+    assert not Path(environment["INFER_TEST_CALLS"]).exists()
+
+
+@pytest.mark.parametrize("args", [("--ready-only",), ("--task", "ready")])
+def test_readiness_refuses_active_teleoperation_before_preparing_motor(environment, args):
+    environment["INFER_TEST_NODES"] = "/controller_manager\n/ar3r_cartesian_retargeting"
+    result = run(environment, *args)
+    assert result.returncode != 0
+    assert "Teleoperation is running" in result.stderr
+    calls = Path(environment["INFER_TEST_CALLS"]).read_text()
+    assert "node list" in calls
+    assert "prepare_ar3_gripper.py" not in calls
+    assert "--check-gripper" not in calls
+    assert "terminal " not in calls
+
+
+@pytest.mark.parametrize("args", [(), ("--ready-only",), ("--task", "ready")])
+def test_active_live_control_blocks_gripper_preparation(environment, args):
+    environment["INFER_TEST_NODES"] = "/controller_manager\n/openpi_ar3_control_1234"
+    result = run(environment, *args)
+    assert result.returncode != 0
+    assert "Live inference is running" in result.stderr
+    calls = Path(environment["INFER_TEST_CALLS"]).read_text()
+    assert "node list" in calls
+    assert "prepare_ar3_gripper.py" not in calls
+    assert "--check-gripper" not in calls
+    assert "terminal " not in calls
+
+
+def test_gripper_preparation_receives_selected_motor_and_timeout(environment):
+    environment.update({"INFER_GRIPPER_CHANNEL": "can1", "INFER_GRIPPER_MOTOR_ID": "17", "INFER_TIMEOUT": "23"})
+    result = run(environment, "--ready-only")
+    assert result.returncode == 0, result.stderr
+    calls = Path(environment["INFER_TEST_CALLS"]).read_text().splitlines()
+    prepare = next(line for line in calls if "prepare_ar3_gripper.py" in line)
+    assert "--channel can1" in prepare
+    assert "--motor-id 17" in prepare
+    assert "--timeout 23" in prepare
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "256", "nan", "1;touch /tmp/unwanted", "9999999999999999999999"])
+def test_invalid_gripper_motor_id_fails_before_any_device_access(environment, value):
+    environment["INFER_GRIPPER_MOTOR_ID"] = value
+    result = run(environment, "--dry-run")
+    assert result.returncode != 0
+    assert "INFER_GRIPPER_MOTOR_ID" in result.stderr
+    assert "1..255" in result.stderr
+    assert not Path(environment["INFER_TEST_CALLS"]).exists()
+
+
+@pytest.mark.parametrize("value", ["1", "255"])
+def test_gripper_motor_id_includes_both_valid_endpoints(environment, value):
+    environment["INFER_GRIPPER_MOTOR_ID"] = value
+    result = run(environment, "--ready-only")
+    assert result.returncode == 0, result.stderr
+    calls = Path(environment["INFER_TEST_CALLS"]).read_text().splitlines()
+    prepare = next(line for line in calls if "prepare_ar3_gripper.py" in line)
+    assert f"--motor-id {value}" in prepare
 
 
 @pytest.mark.parametrize(
@@ -288,13 +518,15 @@ def test_missing_wrench_never_reports_ready(environment):
 
 def test_vscode_debug_is_local_model_and_readonly():
     launch = json.loads((ROOT / ".vscode/launch.json").read_text())
-    debug = next(item for item in launch["configurations"] if item["name"] == "infer_muscleVLTA_debug")
-    assert debug["python"] == "${workspaceFolder}/.venv/bin/python"
-    assert debug["program"].endswith("/scripts/infer_musclevlta_debug.py")
-    assert debug["args"][debug["args"].index("--source") + 1] == "ros-readonly"
-    assert debug["justMyCode"] is False
-    assert "--execute" not in debug["args"]
-    assert "--prompt" in debug["args"]
+    debugs = [item for item in launch["configurations"] if item["name"].startswith("infer_muscleVLTA_debug")]
+    assert "infer_muscleVLTA_debug" in [item["name"] for item in debugs]
+    for debug in debugs:
+        assert debug["python"] == "${workspaceFolder}/.venv/bin/python"
+        assert debug["program"].endswith("/scripts/infer_musclevlta_debug.py")
+        assert debug["args"][debug["args"].index("--source") + 1] == "ros-readonly"
+        assert debug["justMyCode"] is False
+        assert "--execute" not in debug["args"]
+        assert "--prompt" in debug["args"]
     result = subprocess.run(
         [sys.executable, str(ROOT / "scripts/infer_musclevlta_debug.py"), "--source", "fake"],
         text=True,
@@ -436,17 +668,36 @@ def test_explicit_motor_initialization_defers_full_preflight(debug_module, monke
 def test_live_debug_is_separate_explicit_bounded_and_keeps_worker_outside_debugger(debug_module):
     launch = json.loads((ROOT / ".vscode/launch.json").read_text())
     assert launch["configurations"][0]["name"] == "infer_muscleVLTA_debug"
-    live = next(item for item in launch["configurations"] if "LIVE" in item["name"])
-    args, _ = debug_module.client_example.build_parser().parse_known_args(live["args"])
-    debug_module.client_example.validate_execution_args(args)
-    assert args.source == "ros"
-    assert args.execute
-    assert args.max_steps > 0
-    assert args.max_joint_velocity <= 0.1
-    assert "--prompt" in live["args"]
-    assert args.prompt
-    assert not args.initialize_gripper
-    assert live["subProcess"] is False
+    lives = [item for item in launch["configurations"] if "LIVE" in item["name"]]
+    assert lives
+    for live in lives:
+        args, _ = debug_module.client_example.build_parser().parse_known_args(live["args"])
+        debug_module.client_example.validate_execution_args(args)
+        assert args.source == "ros"
+        assert args.execute
+        assert args.max_steps > 0
+        assert args.max_joint_velocity <= 0.1
+        assert "--prompt" in live["args"]
+        assert args.prompt
+        assert not args.initialize_gripper
+        assert live["subProcess"] is False
+
+
+@pytest.mark.parametrize("lora", [False, True])
+def test_debug_rejects_lora_mismatch_between_checkpoint_and_config(debug_module, tmp_path, lora):
+    keys = ["('params', 'PaliGemma', 'llm', 'layers', 'attn', 'q_einsum', 'w', 'value')"]
+    if lora:
+        keys.append("('params', 'PaliGemma', 'llm', 'layers', 'attn', 'q_einsum', 'lora_a', 'value')")
+    (tmp_path / "params").mkdir()
+    (tmp_path / "params/_METADATA").write_text(json.dumps({"tree_metadata": {key: {} for key in keys}}))
+    full = SimpleNamespace(paligemma_variant="gemma_2b", action_expert_variant="gemma_300m")
+    lowmem = SimpleNamespace(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora")
+    assert debug_module.lora_mismatch(tmp_path, "matching", lowmem if lora else full) is None
+    error = debug_module.lora_mismatch(tmp_path, "mismatched", full if lora else lowmem)
+    expected = debug_module.LOWMEM_CONFIG if lora else debug_module.FINE_TUNING_CONFIG
+    assert error.endswith(f"use --config-name {expected}.")
+    # An unreadable checkpoint layout never blocks loading; the model load verifies the structure itself.
+    assert debug_module.lora_mismatch(tmp_path / "missing", "any", lowmem) is None
 
 
 def test_live_debug_fails_before_loading_model_when_prerequisite_is_missing(debug_module, tmp_path, capsys):

@@ -1,12 +1,16 @@
 """Local-model debug: read-only by default; --source ros --execute enables physical actions."""
 
 import copy
+import json
 import logging
 import os
 from pathlib import Path
 import time
 
 import ar3_force_visuotactile_client_example as client_example
+
+LOWMEM_CONFIG = "pi05_ar3_force_visuotactile_reactive_lowmem"
+FINE_TUNING_CONFIG = "pi05_ar3_force_visuotactile_reactive"
 
 
 class LocalPolicyClient:
@@ -57,6 +61,28 @@ def check_readonly_observations(args):
     )
 
 
+def lora_mismatch(checkpoint: Path, config_name: str, model_config) -> str | None:
+    """Error message if the checkpoint and the model config disagree on LoRA adapters, checked before loading."""
+    try:
+        tree = json.loads((checkpoint / "params" / "_METADATA").read_text())["tree_metadata"]
+    except (OSError, ValueError, KeyError, TypeError):
+        tree = None
+    if not isinstance(tree, dict) or not any("PaliGemma" in key for key in tree):
+        return None  # Unknown layout: the model load still verifies the full parameter structure.
+    has_lora = any("lora" in key for key in tree)
+    uses_lora = any(
+        "lora" in str(getattr(model_config, name, ""))
+        for name in ("paligemma_variant", "action_expert_variant", "reactive_action_expert_variant")
+    )
+    if has_lora == uses_lora:
+        return None
+    kind, expected = ("LoRA (lowmem) training", LOWMEM_CONFIG) if has_lora else ("full fine-tuning", FINE_TUNING_CONFIG)
+    return (
+        f"{checkpoint} comes from {kind}, but --config-name {config_name} "
+        f"{'lacks' if has_lora else 'adds'} LoRA adapters; use --config-name {expected}."
+    )
+
+
 def main(argv=None):
     parser = client_example.build_parser()
     parser.description = __doc__
@@ -76,6 +102,9 @@ def main(argv=None):
         parser.error("--check-observations only allows --source ros-readonly.")
     try:
         client_example.validate_execution_args(args)
+        if args.record_parquet:
+            # Before the observation check and the model load (run() opens the recording again).
+            client_example.ParquetDatasetRecorder(args.record_parquet, fps=args.fps)
     except ValueError as exc:
         parser.error(str(exc))
     if args.execute:
@@ -120,6 +149,8 @@ def main(argv=None):
 
     logging.info("Do not run a second policy server on this GPU at the same time.")
     train_config = config.get_config(args.config_name)
+    if error := lora_mismatch(checkpoint, args.config_name, train_config.model):
+        parser.error(error)
     policy = policy_config.create_trained_policy(
         train_config, checkpoint, default_prompt=args.prompt or client_example.PROMPT
     )

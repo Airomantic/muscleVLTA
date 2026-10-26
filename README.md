@@ -137,7 +137,13 @@ The laptop uses its own project `.venv` (Python 3.11), independently of the H100
 including `params/` and `assets/`, at `infer_checkpoint/29999`. The PaliGemma tokenizer belongs at
 `${OPENPI_DATA_HOME:-$HOME/.cache/openpi}/big_vision/paligemma_tokenizer.model`.
 Use the **lowmem** model configuration for these LoRA weights; no adapter merge or second training stage is
-required to run inference. Completing the offline step budget does not establish physical task success;
+required to run inference. The full fine-tuned checkpoint of the 6×H100 run
+(`scripts/train_ar3_g2_force_visuotactile_gpu012345.sh`, no `lora_a`/`lora_b` params) belongs at
+`infer_checkpoint/23000` and needs `--config-name pi05_ar3_force_visuotactile_reactive`; use the
+**`infer_muscleVLTA_debug_fineTuning`** / **`infer_muscleVLTA_LIVE_fineTuning (MOVES ARM + GRIPPER)`**
+counterparts of the configurations below. Inputs, outputs and safety limits are identical; each checkpoint
+uses the normalization statistics stored in its own `assets/`. A mismatched checkpoint and config fails before
+loading the weights and names the right `--config-name`. Completing the offline step budget does not establish physical task success;
 LIFT's online corrective DAgger is an additional adaptation procedure. A still-zero force cross-attention
 output blocks force/tactile influence even when the reactive model runs; inference setup cannot repair a
 force pathway frozen during training.
@@ -155,16 +161,44 @@ MessageBridge/Puppetry, retargeting, gripper teleoperation, recording, or a robo
 **Arm bringup powers the arm, and the camera servo moves.** Clear the workspace before running it;
 closing a terminal is not an emergency stop or a guarantee of arm power-off.
 SSH uses verified `known_hosts` entries and interactive/key authentication, never embedded passwords.
+Before opening tabs, the launcher adds `192.168.127.100/24` to the wired interface `enp132s0` if missing
+(enter the local sudo password when prompted), preserving its other addresses. It checks that the gripper
+at `192.168.127.10` uses that interface and source address, so a missing subnet cannot silently send SSH
+through the Wi-Fi default route. This also runs with `--no-arm` or `--no-ssh`; `--check` and `--dry-run`
+do not access or change networking. Override `INFER_GRIPPER_INTERFACE` (defaults to `INFER_ARM_INTERFACE`)
+and `INFER_GRIPPER_CIDR` for other wiring; the tactile config's `pc_host` must match that local IP.
+The `192.168.2.240` address in Puppetry is the teleoperation exoskeleton, not the gripper.
 The readiness tab requires actual sensor messages, measured tilt feedback, and valid, connected, initialized
 gripper feedback, not only advertised topics or a responsive gRPC service. The front camera uses MJPG;
 the Gemini 305 wrist camera uses its supported **YUYV** profile at 640x480/30 FPS with the **V4L2** UVC
 backend. On this setup, libuvc can report the wrist camera online but produce no frames even with YUYV.
 
+The readiness task also connects the gripper's CAN interface (`can0`, motor ID `1`) if disconnected,
+then waits for valid feedback. The connection stays open on the server for inference; the hardware
+open/close test instead disconnects when it exits, so a successful test does not keep inference ready.
+If the other service tabs are already running, retry just readiness without launching duplicate nodes:
+
+```bash
+./infer_oneclick.sh --ready-only
+```
+
+Connecting does not enable or calibrate the motor. If valid feedback reports that calibration is needed,
+clear the gripper workspace and explicitly allow it (**the gripper moves during calibration**):
+
+```bash
+./infer_oneclick.sh --ready-only --initialize-gripper
+```
+
+For a fresh startup, `./infer_oneclick.sh --initialize-gripper` permits the same preparation. Already
+initialized motors are reused without recalibration; no open/close or target-position command is sent
+by preparation. Override `INFER_GRIPPER_CHANNEL` and `INFER_GRIPPER_MOTOR_ID` for a different CAN setup.
+
 After the `ready` tab reports preparation complete, select **`infer_muscleVLTA_debug`** in VS Code's
 Run and Debug menu and press **F5**. This configuration loads the model **inside the debugged process on GPU 0**,
 reads real observations, and opens Rerun with cameras, tactile depth, wrenches, joint states and predicted actions.
 Before loading the model, it checks a complete real observation and fails early if an input is unavailable.
-No predicted action is sent to the arm or gripper. Outputs go to `outputs/infer_muscleVLTA_debug/`.
+No predicted action is sent to the arm or gripper. Outputs go to `outputs/infer_muscleVLTA_debug/`
+(`outputs/infer_muscleVLTA_debug_fineTuning/` for the full fine-tuned checkpoint).
 Stop with Ctrl+C in the integrated terminal to save the summary and close the observation worker cleanly.
 
 To check inputs without loading the checkpoint, allocating GPU memory, or opening Rerun:
@@ -175,7 +209,8 @@ To check inputs without loading the checkpoint, allocating GPU memory, or openin
 
 This check is strictly read-only. A camera node/topic with no image samples is not ready; inspect the camera
 task's log and supported stream format. `GetAllState` reporting `connected=False`, `valid=False`, or
-`init_state != 1` requires motor preparation through your approved driver, not a larger inference timeout.
+`init_state != 1` requires motor preparation with `./infer_oneclick.sh --ready-only` as above.
+It cannot be repaired by increasing the inference timeout.
 
 Breakpoints in `scripts/ar3_force_visuotactile_client_example.py` and `src/openpi/policies/policy.py` run in
 that same process. JAX-compiled model functions normally hit Python breakpoints only during tracing; for
@@ -184,9 +219,9 @@ line-by-line model debugging, temporarily add `"JAX_DISABLE_JIT": "1"` to the la
 
 Real observations come from `/front/color/image_raw`, `/wrist/color/image_raw`, `/joint_states`,
 and `/v3_gripper/tactile/{sensor_0,sensor_2}/{depth,wrench}`. Gripper position is obtained by read-only
-`GetAllState`; neither the launcher nor debug performs CAN `Connect`, motor initialization, or motion.
-If the gripper has no valid connected state, prepare it using the approved device workflow first;
-debug must not substitute a fabricated position. `--force-level 80` is the **known commanded SDK setting**,
+`GetAllState`. F5 read-only debug performs no motor writes; the launcher connects CAN and only permits
+calibration with `--initialize-gripper`. Debug must not substitute a fabricated position when feedback
+is missing. `--force-level 80` is the **known commanded SDK setting**,
 not a measured force; keep it consistent with the actual gripper setting. Missing, invalid or stale observations
 are errors, not zero-filled inputs. Finger wrenches remain in the same sensor-local frames used in training.
 
@@ -203,7 +238,9 @@ does not start a policy server, leaving GPU memory available for local debugging
 ##### Explicit LIVE execution (physical motion)
 
 The original **`infer_muscleVLTA_debug`** remains prediction-only. The separate VS Code configuration
-**`infer_muscleVLTA_LIVE (MOVES ARM + GRIPPER)`** uses `--source ros --execute` and will send real targets.
+**`infer_muscleVLTA_LIVE (MOVES ARM + GRIPPER)`** uses `--source ros --execute` and will send real targets
+(**`infer_muscleVLTA_LIVE_fineTuning (MOVES ARM + GRIPPER)`** does the same with the full fine-tuned checkpoint;
+its `_recordParquet` variant also records every run, see [Recording LIVE runs](#recording-live-runs-parquet)).
 Stop the read-only model first to free its GPU memory. Only start LIVE with a clear workspace, a verified
 starting pose and checkpoint/action units, no teleoperation/replay/MoveIt goal, and an accessible physical
 emergency stop. Do not attach a debugger to the independent control worker.
@@ -239,6 +276,36 @@ exit. Motor calibration additionally requires `--initialize-gripper` (not enable
 it can cause full-stroke motion. Changing the force or position predictions in LIVE controls the actual
 gripper; unlike read-only mode, acknowledged force commands become the next observation's force setting.
 Ctrl+C/EOF or the step budget ends the run with a stop request. Closing only Rerun does not stop control.
+
+##### Recording LIVE runs (parquet)
+
+**`infer_muscleVLTA_LIVE_fineTuning_recordParquet (MOVES ARM + GRIPPER)`** is the LIVE fine-tuning configuration
+(same checkpoint and limits; it moves the robot) with the training prompt and
+`--record-parquet ${workspaceFolder}/dataRecordParquet`. Each run with executed steps appends one episode to a LeRobot
+v3.0 dataset laid out like the training data (`meta/info.json`, `meta/tasks.parquet`, `meta/episodes/`,
+`meta/stats.json`, one `data/chunk-000/file-XXX.parquet` per episode), so inference can be compared with the
+demonstrations. One row per executed control step:
+
+| Column | Shape | Content |
+| --- | --- | --- |
+| `observation.state` | (8,) | 7 joint positions [rad] + gripper position (0..1000), measured before the step's action; `observation.state[:8]` of the training data |
+| `observation.arm_effort` | (7,) | measured joint torques [Nm] |
+| `action` | (9,) | target applied by the control worker: joints after its step / velocity limits, gripper position and force level clipped to the SDK ranges |
+| `policy.action` | (9,) | raw policy prediction in the same layout; it differs from `action` where the limits held the arm back |
+| `policy.chunk_step` | scalar | step within the action chunk (0: VLM replan) |
+| `sync.control_time_s` | scalar | wall-clock time since the episode start [s]; `timestamp` is the nominal `frame_index / fps` |
+
+Camera videos, finger wrenches and tactile depth are not recorded. The episode rows in `meta/episodes/` add
+`inference/*` columns: config, mode, reactive `k`, CLI arguments (JSON), start time and outcome (`completed`,
+`interrupted` or the error).
+
+The episode is written when the run ends: at the step budget, after an error, on Ctrl+C, or on the first VS Code
+**Stop** (`"onTerminate": "KeyboardInterrupt"` turns it into Ctrl+C, so the stop request and the save still run).
+Wait for the `Recorded episode ...` log line: a second Stop kills the process at once and loses an unsaved episode.
+Before any motion, the run refuses a directory it cannot append to: a training dataset, a recording with other
+columns or fps, or another non-empty directory; choose another directory then. `dataRecordParquet/` is gitignored.
+Read it with `pandas.read_parquet("dataRecordParquet/data")` (episodes: `dataRecordParquet/meta/episodes`) or with
+`openpi.data.lerobot_v3.LeRobotV3Dataset`. Recording needs pyarrow and pandas (both in the openpi environment).
 
 ##### WebSocket serving and replay
 
@@ -311,17 +378,20 @@ The summary reports the inference latency and the errors against the recorded ac
 - joint MAE for each step of the chunk
 
 `--output-dir` writes `rollout.npz` (state and policy / executed / recorded actions for each step) and
-`summary.json`.
+`summary.json`. `--record-parquet DIR` also appends the run to an inference dataset (see
+[Recording LIVE runs](#recording-live-runs-parquet)).
 
 The `.rrd` file uses the panels of the dataset viewer: cameras, gripper, force level, state / action, arm effort,
 finger wrenches and tactile depth. It adds the policy actions, a "policy vs recorded" tab for each joint and the
-inference latency. Open it with the same rerun version that wrote it (`uvx --from rerun-sdk==0.23.1 rerun
-replay/episode_16.rrd`). You can also stream to a running viewer with `--rerun rerun+http://HOST:9876/proxy`, or open
-one with `--rerun spawn`.
+inference latency. Only dataset replay has recorded actions: with live or fake observations, the "action (recorded)"
+panel is omitted and the tab compares the policy with the measured state ("policy vs measured state", or
+"predictions vs measured state" in read-only mode). Open it with the same rerun version that wrote it
+(`uvx --from rerun-sdk==0.23.1 rerun replay/episode_16.rrd`). You can also stream to a running viewer with
+`--rerun rerun+http://HOST:9876/proxy`, or open one with `--rerun spawn`.
 
 On the robot PC, install the client with `pip install --no-deps -e packages/openpi-client` plus `msgpack websockets
-pillow dm-tree typing_extensions`. This avoids downgrading numpy in an existing numpy 2 environment, because
-openpi-client pins `numpy<2`.
+pillow dm-tree typing_extensions` (and `pyarrow pandas` for `--record-parquet`). This avoids downgrading numpy in an
+existing numpy 2 environment, because openpi-client pins `numpy<2`.
 
 ## 🔄 Online DAgger Launchers
 
