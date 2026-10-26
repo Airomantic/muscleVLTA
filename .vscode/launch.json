@@ -2,6 +2,91 @@
     "version": "0.2.0",
     "configurations": [
         {
+            // Debug copy of scripts/train_ar3_g2_force_visuotactile_gpu012345.sh (same config / data / weights / LR
+            // schedule) on GPUs 6,7. JAX runs all GPUs in this one process, so multi-GPU debugging just works.
+            // Checkpoints go to a separate debug root and --overwrite only wipes debug_gpu67 there; never point
+            // --exp-name / --checkpoint-base-dir at the running batch experiment.
+            "name": "train_debug_gpu67 (FSDP=2, like batch training)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "program": "${workspaceFolder}/scripts/train.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "6,7",
+                "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.9",
+                "PYTHONPATH": "${workspaceFolder}/src:${workspaceFolder}/packages/openpi-client/src",
+                "PYTHONUNBUFFERED": "1",
+                "LD_LIBRARY_PATH": "",
+                "OPENPI_AR3_REPO_ID": "/data/jiang/ar3_force_computeChargingPullOut_force_aware",
+                "OPENPI_AR3_ASSET_ID": "ar3_force_computeChargingPullOut_force_aware",
+                "OPENPI_AR3_WEIGHT_PATH": "/data/jiang/checkpoints/openpi-assets/checkpoints/pi05_base/params",
+                "OPENPI_DATA_HOME": "${env:HOME}/.cache/openpi",
+                "OPENPI_TACTILE_CACHE_DIR": "${env:HOME}/.cache/openpi/lerobot_v3_tactile",
+                "WANDB_MODE": "disabled"
+            },
+            "args": [
+                "pi05_ar3_force_visuotactile_reactive",
+                "--exp-name", "debug_gpu67",
+                "--checkpoint-base-dir", "/data/jiang/train_checkpoints_debug",
+                "--overwrite",
+                "--fsdp-devices", "2",
+                "--batch-size", "32",
+                "--num-train-steps", "400000",
+                "--lr-schedule.decay-steps", "400000",
+                "--keep-period", "50000",
+                // 0 keeps data loading in this process so breakpoints in the dataset / transforms are hit.
+                "--num-workers", "0",
+                "--log-interval", "1",
+                "--no-wandb-enabled"
+            ]
+        },
+        {
+            // Single-GPU fallback while GPU 7 is busy: the full model does not fit on one GPU with EMA (~77 GB of
+            // params + EMA + AdamW + grads), so EMA is off and the batch is tiny. Model, data and transforms are
+            // the same as above.
+            "name": "train_debug_gpu6 (1 GPU, EMA off)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "program": "${workspaceFolder}/scripts/train.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "6",
+                "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.9",
+                "PYTHONPATH": "${workspaceFolder}/src:${workspaceFolder}/packages/openpi-client/src",
+                "PYTHONUNBUFFERED": "1",
+                "LD_LIBRARY_PATH": "",
+                "OPENPI_AR3_REPO_ID": "/data/jiang/ar3_force_computeChargingPullOut_force_aware",
+                "OPENPI_AR3_ASSET_ID": "ar3_force_computeChargingPullOut_force_aware",
+                "OPENPI_AR3_WEIGHT_PATH": "/data/jiang/checkpoints/openpi-assets/checkpoints/pi05_base/params",
+                "OPENPI_DATA_HOME": "${env:HOME}/.cache/openpi",
+                "OPENPI_TACTILE_CACHE_DIR": "${env:HOME}/.cache/openpi/lerobot_v3_tactile",
+                "WANDB_MODE": "disabled"
+            },
+            "args": [
+                "pi05_ar3_force_visuotactile_reactive",
+                "--exp-name", "debug_gpu6",
+                "--checkpoint-base-dir", "/data/jiang/train_checkpoints_debug",
+                "--overwrite",
+                "--fsdp-devices", "1",
+                "--batch-size", "4",
+                "--ema-decay", "None",
+                "--num-train-steps", "400000",
+                "--lr-schedule.decay-steps", "400000",
+                "--keep-period", "50000",
+                "--num-workers", "0",
+                "--log-interval", "1",
+                "--no-wandb-enabled"
+            ]
+        },
+        {
             "name": "infer_muscleVLTA_debug",
             "type": "debugpy",
             "request": "launch",
