@@ -155,7 +155,7 @@
                 "--max-joint-velocity", "0.1",
                 "--max-target-deviation", "0.25",
                 "--command-timeout", "0.5",
-                "--gripper-speed", "10",
+                "--gripper-speed", "80",
                 "--ros-domain-id", "111",
                 "--front-topic", "/front/color/image_raw",
                 "--wrist-topic", "/wrist/color/image_raw",
@@ -238,7 +238,7 @@
                 "--max-joint-velocity", "0.1",
                 "--max-target-deviation", "0.25",
                 "--command-timeout", "0.5",
-                "--gripper-speed", "10",
+                "--gripper-speed", "80",
                 "--ros-domain-id", "111",
                 "--front-topic", "/front/color/image_raw",
                 "--wrist-topic", "/wrist/color/image_raw",
@@ -284,7 +284,7 @@
                 "--max-joint-velocity", "0.1",
                 "--max-target-deviation", "0.25",
                 "--command-timeout", "0.5",
-                "--gripper-speed", "10",
+                "--gripper-speed", "80",
                 "--ros-domain-id", "111",
                 "--front-topic", "/front/color/image_raw",
                 "--wrist-topic", "/wrist/color/image_raw",
@@ -297,6 +297,97 @@
                 "--rerun", "spawn",
                 "--output-dir", "${workspaceFolder}/outputs/infer_muscleVLTA_live_fineTuning_recordParquet",
                 "--record-parquet", "${workspaceFolder}/dataRecordParquet"
+            ]
+        },
+        {
+            // v2 model (pi05_ar3_force_visuotactile_reactive_v2, full fine-tune): copy or symlink a step of
+            // /data/jiang/train_checkpoints/pi05_ar3_force_visuotactile_reactive_v2/<exp>/<step> to infer_checkpoint/v2.
+            // The force history comes from the server metadata (force_history_frames), no extra flag is needed.
+            "name": "infer_muscleVLTA_debug_v2",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "program": "${workspaceFolder}/scripts/infer_musclevlta_debug.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src:${workspaceFolder}/packages/openpi-client/src",
+                "PYTHONUNBUFFERED": "1",
+                "LD_LIBRARY_PATH": "",
+                "ROS_DOMAIN_ID": "111",
+                "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+            },
+            "args": [
+                "--checkpoint-dir", "${workspaceFolder}/infer_checkpoint/v2",
+                "--config-name", "pi05_ar3_force_visuotactile_reactive_v2",
+                "--gpu", "0",
+                "--source", "ros-readonly",
+                "--prompt", "Unplug the white charging plug from the white socket and place it on the table",
+                "--mode", "reactive",
+                "--fps", "15",
+                "--ros-domain-id", "111",
+                "--front-topic", "/front/color/image_raw",
+                "--wrist-topic", "/wrist/color/image_raw",
+                "--joint-topic", "/joint_states",
+                "--tactile-prefix", "/v3_gripper/tactile",
+                "--gripper-address", "192.168.127.10:50008",
+                "--force-level", "80",
+                "--observation-max-age", "0.5",
+                "--observation-timeout", "10",
+                "--rerun", "spawn",
+                "--output-dir", "${workspaceFolder}/outputs/infer_muscleVLTA_debug_v2"
+            ]
+        },
+        {
+            // v2 LIVE: like the recordings, 15 Hz policy actions, joint setpoints streamed at 100 Hz with a 0.08 s
+            // horizon, gripper speed 80. Demos reach 0.15 (p90) to 0.24 rad/s per joint; raise
+            // --max-joint-velocity only after validating the motion at 0.1.
+            "name": "infer_muscleVLTA_LIVE_v2 (MOVES ARM + GRIPPER)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "program": "${workspaceFolder}/scripts/infer_musclevlta_debug.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src:${workspaceFolder}/packages/openpi-client/src",
+                "PYTHONUNBUFFERED": "1",
+                "LD_LIBRARY_PATH": "",
+                "ROS_DOMAIN_ID": "111",
+                "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+            },
+            "args": [
+                "--checkpoint-dir", "${workspaceFolder}/infer_checkpoint/v2",
+                "--config-name", "pi05_ar3_force_visuotactile_reactive_v2",
+                "--gpu", "0",
+                "--source", "ros",
+                "--execute",
+                "--prompt", "Unplug the white charging plug from the white socket and place it on the table",
+                "--mode", "reactive",
+                "--fps", "15",
+                "--max-steps", "300",
+                "--max-joint-step", "0.03",
+                "--max-joint-velocity", "0.1",
+                "--max-target-deviation", "0.25",
+                "--command-timeout", "0.5",
+                "--gripper-speed", "80",
+                "--stream-rate", "100",
+                "--command-horizon", "0.08",
+                "--ros-domain-id", "111",
+                "--front-topic", "/front/color/image_raw",
+                "--wrist-topic", "/wrist/color/image_raw",
+                "--joint-topic", "/joint_states",
+                "--tactile-prefix", "/v3_gripper/tactile",
+                "--gripper-address", "192.168.127.10:50008",
+                "--force-level", "80",
+                "--observation-max-age", "0.5",
+                "--observation-timeout", "10",
+                "--rerun", "spawn",
+                "--output-dir", "${workspaceFolder}/outputs/infer_muscleVLTA_live_v2"
             ]
         }
     ]

@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 # Train the muscleVLTA AR3 + Daimon tac G2 force / visuo-tactile reactive policy (pi05 + LIFT reactive expert +
-# multi-rate MoT force / tactile memory) on GPUs 0,1,2,3 of the H100 server, sized to use most of the GPU memory.
+# multi-rate MoT force / tactile memory) on GPUs 0-5 of the H100 server, sized to use most of the GPU memory.
 #
 # Quick start (from the repository root):
-#   bash scripts/train_ar3_g2_force_visuotactile_gpu0123.sh
+#   bash scripts/train_ar3_g2_force_visuotactile_gpu012345.sh
 #
 # Overrides (environment variables):
-#   OPENPI_CONFIG_NAME     pi05_ar3_force_visuotactile_reactive (default) | pi05_ar3_force_reactive | pi05_ar3_base
+#   OPENPI_CONFIG_NAME     pi05_ar3_force_visuotactile_reactive_v2 (default: force history, latency 2, aligned tactile
+#                          tokens, 19D force, gripper open / close head, oversampled open / close chunks) |
+#                          pi05_ar3_force_visuotactile_reactive (v1) | pi05_ar3_force_reactive | pi05_ar3_base
 #   OPENPI_EXP_NAME        experiment name (default: ar3_g2_mot_<date>), checkpoints/<config>/<exp>/
 #   OPENPI_AR3_REPO_ID     LeRobot v3.0 dataset dir (default: /data/jiang/ar3_force_computeChargingPullOut_force_aware)
 #   OPENPI_AR3_WEIGHT_PATH pi05_base params (default: /data/jiang/checkpoints/openpi-assets/checkpoints/pi05_base/params)
-#   OPENPI_CUDA_VISIBLE_DEVICES  GPUs (default 0,1,2,3); fsdp devices = number of GPUs
-#   OPENPI_BATCH_SIZE      global batch, divisible by the GPU count (default 128 = 32 per H100)
-#   OPENPI_NUM_TRAIN_STEPS (default 300000), OPENPI_NUM_WORKERS (default 16)
+#   OPENPI_CUDA_VISIBLE_DEVICES  GPUs (default 0,1,2,3,4,5); fsdp devices = number of GPUs
+#   OPENPI_BATCH_SIZE      global batch, divisible by the GPU count (default 192 = 32 per H100)
+#   OPENPI_NUM_TRAIN_STEPS (default 600000), OPENPI_NUM_WORKERS (default 16)
 #   OPENPI_LR_DECAY_STEPS  cosine decay length (default: OPENPI_NUM_TRAIN_STEPS; the config's own value is 30000)
 #   OPENPI_KEEP_PERIOD     keep every N-th checkpoint permanently (default 50000); the latest one is always kept
 #   OPENPI_CHECKPOINT_BASE_DIR  checkpoint root (default ./checkpoints)
@@ -26,12 +28,12 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-CONFIG_NAME="${OPENPI_CONFIG_NAME:-pi05_ar3_force_visuotactile_reactive}"
+CONFIG_NAME="${OPENPI_CONFIG_NAME:-pi05_ar3_force_visuotactile_reactive_v2}"
 EXP_NAME="${OPENPI_EXP_NAME:-ar3_g2_mot_$(date +%Y%m%d_%H%M)}"
 GPUS="${OPENPI_CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}"
 NUM_GPUS="$(awk -F, '{print NF}' <<<"${GPUS}")"
 BATCH_SIZE="${OPENPI_BATCH_SIZE:-192}"
-NUM_TRAIN_STEPS="${OPENPI_NUM_TRAIN_STEPS:-400000}"
+NUM_TRAIN_STEPS="${OPENPI_NUM_TRAIN_STEPS:-600000}"
 LR_DECAY_STEPS="${OPENPI_LR_DECAY_STEPS:-${NUM_TRAIN_STEPS}}"
 KEEP_PERIOD="${OPENPI_KEEP_PERIOD:-50000}"
 # CHECKPOINT_BASE_DIR="${OPENPI_CHECKPOINT_BASE_DIR:-${REPO_ROOT}/checkpoints}"
