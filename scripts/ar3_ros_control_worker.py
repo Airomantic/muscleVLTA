@@ -7,6 +7,14 @@ Each fresh observation authorizes ONE bounded target. No complete trajectory is
 queued. A separate watchdog stops on missed commands, stale feedback or conflicts,
 even when the model/debugger is paused. Stop means a short controller hold plus
 an acknowledged gripper Stop, NOT a safety-rated emergency stop or arm power-off.
+
+By default every target is published as one trajectory point reached after
+--command-period, and the worker waits until the controller reference arrives,
+so the arm decelerates to rest at every control step. With --stream-rate, the
+worker instead approaches each bounded target with setpoints interpolated over
+one command period and published at that rate, each to be reached after
+--command-horizon, like the teleoperation that recorded the training data
+(100 Hz, 0.08 s): the arm moves continuously at the policy rate.
 """
 
 import argparse
@@ -50,6 +58,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-target-deviation", type=float, default=0.25)
     parser.add_argument("--command-timeout", type=float, default=0.5)
     parser.add_argument("--gripper-speed", type=int, default=20)
+    parser.add_argument(
+        "--stream-rate",
+        type=float,
+        default=0.0,
+        help="publish setpoints interpolated towards each target at this rate [Hz] (teleoperation: 100); "
+        "0: one point per target, waiting until the controller reaches it",
+    )
+    parser.add_argument(
+        "--command-horizon", type=float, default=0.08, help="time_from_start of streamed setpoints [s] (0.08)"
+    )
     args = parser.parse_args(argv)
     observations.validate_observation_arguments(parser, args)
     if not args.execute:
@@ -63,6 +81,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--command-timeout must exceed the command period and be <= 2 seconds")
     if not 1 <= args.gripper_speed <= 100:
         parser.error("--gripper-speed must be in 1..100")
+    if args.stream_rate:
+        if not math.isfinite(args.stream_rate) or not 1 / args.command_period <= args.stream_rate <= 500:
+            parser.error("--stream-rate must be 0 or between the command rate and 500 Hz")
+        if not math.isfinite(args.command_horizon) or not 1 / args.stream_rate < args.command_horizon <= 0.2:
+            parser.error("--command-horizon must exceed the stream period and be <= 0.2 seconds")
     if not args.controller_name or "/" in args.controller_name:
         parser.error("--controller-name must be a nonempty controller name without '/'")
     if args.joint_command_topic != f"/{args.controller_name}/joint_trajectory":
@@ -393,7 +416,7 @@ class ROSHardware:
             )
         return result, now + self.args.max_age - max(ages)
 
-    def publish(self, target: np.ndarray, *, hold: bool = False) -> float:
+    def publish(self, target: np.ndarray, *, hold: bool = False, horizon: float | None = None) -> float:
         from builtin_interfaces.msg import Duration
         from trajectory_msgs.msg import JointTrajectory
         from trajectory_msgs.msg import JointTrajectoryPoint
@@ -402,7 +425,7 @@ class ROSHardware:
         point.positions = target.tolist()
         if hold:
             point.velocities = [0.0] * 7
-        nanoseconds = round(self.args.command_period * 1_000_000_000)
+        nanoseconds = round((horizon or self.args.command_period) * 1_000_000_000)
         point.time_from_start = Duration(sec=nanoseconds // 1_000_000_000, nanosec=nanoseconds % 1_000_000_000)
         message = JointTrajectory(joint_names=list(self.args.joint_names), points=[point])
         self.arm_touched = True
@@ -479,10 +502,26 @@ class ControlSession:
         self.stop_error: str | None = None
         self.watchdog_exit = threading.Event()
         self.watchdog: threading.Thread | None = None
+        # --stream-rate: the setpoint moves from stream_start (at stream_time) to stream_target in one command period.
+        # Lock order: self.lock before self.stream_lock; the stream thread only takes self.stream_lock.
+        self.stream_lock = threading.Lock()
+        self.stream_exit = threading.Event()
+        self.stream_thread: threading.Thread | None = None
+        self.stream_start: np.ndarray | None = None
+        self.stream_target: np.ndarray | None = None
+        self.stream_setpoint: np.ndarray | None = None
+        self.stream_time = 0.0
+        self.stream_error: str | None = None
+
+    @property
+    def streaming(self) -> bool:
+        return self.args.stream_rate > 0
 
     def require_running(self) -> None:
         if self.halted:
             raise RuntimeError(f"Control is stopped; a new session is required. {self.stop_error or ''}")
+        if self.stream_error:
+            raise RuntimeError(f"Setpoint stream failed: {self.stream_error}")
         if self.last_command is not None and self.clock() - self.last_command >= self.args.command_timeout:
             raise TimeoutError("Command watchdog expired; paused inference cannot resume motion")
 
@@ -509,6 +548,8 @@ class ControlSession:
             measured = self.hardware.current_joints()
             if self.hardware.limits is None:
                 raise RuntimeError("Robot joint limits are unavailable")
+            # The first target is bounded like the following ones, relative to the measured joints.
+            first = self.previous_target is None
             applied = self.hardware.limits.bound_action(
                 action,
                 measured,
@@ -516,8 +557,9 @@ class ControlSession:
                 max_step=self.args.max_joint_step,
                 max_velocity=self.args.max_joint_velocity,
                 max_deviation=self.args.max_target_deviation,
-                previous_target=self.previous_target,
-                elapsed=None if self.last_command is None else now - self.last_command,
+                previous_target=measured if first else self.previous_target,
+                elapsed=self.args.command_period if first else now - self.last_command,
+                tracking_lag=self.args.command_horizon + 1 / self.args.stream_rate if self.streaming else 0.0,
             )
             self.last_command = now
             deadline = min(pending[1], now + self.args.command_timeout)
@@ -525,16 +567,55 @@ class ControlSession:
             if self.clock() >= deadline:
                 raise TimeoutError("Command deadline expired before arm publication")
             self.hardware.current_joints()
-            started = self.hardware.publish(applied[:7])
-            self.hardware.wait_target(applied[:7], started, deadline)
+            if self.streaming:
+                self.stream_to(applied[:7], measured)
+            else:
+                started = self.hardware.publish(applied[:7])
+                self.hardware.wait_target(applied[:7], started, deadline)
             self.previous_target = applied[:7].copy()
             return {"__observation_id__": np.asarray(identifier), "__executed_action__": applied}
+
+    def stream_to(self, target: np.ndarray, measured: np.ndarray) -> None:
+        """Moves the streamed setpoint from its current value (initially the measured joints) to target."""
+        with self.stream_lock:
+            start = measured if self.stream_setpoint is None else self.stream_setpoint
+            self.stream_start = np.array(start, dtype=np.float64)
+            self.stream_target = np.array(target, dtype=np.float64)
+            self.stream_time = self.clock()
+
+    def stream_step(self) -> None:
+        """Publishes the current setpoint; after one command period it stays at the target until the next one."""
+        with self.stream_lock:
+            if self.stream_exit.is_set() or self.stream_target is None:
+                return
+            alpha = min(max((self.clock() - self.stream_time) / self.args.command_period, 0.0), 1.0)
+            setpoint = self.stream_start + alpha * (self.stream_target - self.stream_start)
+            self.hardware.publish(setpoint, horizon=self.args.command_horizon)
+            self.stream_setpoint = setpoint
+
+    def start_stream(self) -> None:
+        if not self.streaming:
+            return
+
+        def stream() -> None:
+            try:
+                while not self.stream_exit.wait(1 / self.args.stream_rate):
+                    self.stream_step()
+            except (RuntimeError, ValueError, TypeError, AttributeError, OSError) as exc:
+                self.stream_error = str(exc) or type(exc).__name__
+                logger.exception("Setpoint stream failed; the watchdog stops the arm")
+
+        self.stream_thread = threading.Thread(target=stream, name="ar3-setpoint-stream", daemon=True)
+        self.stream_thread.start()
 
     def stop(self, reason: str, *, requested: bool = False) -> None:
         with self.lock:
             if not self.halted:
                 self.halted = True
                 self.pending = None
+                with self.stream_lock:
+                    # Waits for a setpoint in flight; no streamed setpoint can override the hold below.
+                    self.stream_exit.set()
                 logger.log(logging.INFO if requested else logging.WARNING, "Stopping LIVE execution: %s", reason)
                 errors = []
                 # Both must be attempted, even if one actuator's transport has failed.
@@ -573,9 +654,11 @@ class ControlSession:
         try:
             self.stop("worker closing")
         finally:
+            self.stream_exit.set()
             self.watchdog_exit.set()
-            if self.watchdog is not None:
-                self.watchdog.join(timeout=2)
+            for thread in (self.stream_thread, self.watchdog):
+                if thread is not None:
+                    thread.join(timeout=2)
 
 
 def stopped_error(session: ControlSession | None, error: str) -> dict[str, np.ndarray]:
@@ -643,6 +726,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         gripper.prepare()
         hardware.observe()
         session.start_watchdog()
+        session.start_stream()
         status = serve_requests(sys.stdin.buffer, output, session)
     except KeyboardInterrupt:
         logger.warning("LIVE worker interrupted; stopping hardware")

@@ -48,11 +48,19 @@ class JointLimits:
         max_deviation: float,
         previous_target: np.ndarray | None = None,
         elapsed: float | None = None,
+        tracking_lag: float = 0.0,
     ) -> np.ndarray:
-        """Reject malformed/implausible targets, then cap changes relative to feedback and prior commands."""
+        """Reject malformed/implausible targets, then cap changes relative to feedback and prior commands.
+
+        tracking_lag [s] widens the band around the measured joints by the lag of the feedback behind streamed
+        setpoints (command horizon + stream period), so that the arm can keep moving at the velocity cap; the change
+        w.r.t. the previous target stays capped at velocity * period.
+        """
         for value in (period, max_step, max_velocity, max_deviation):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError("Execution limits and period must be finite and positive.")
+        if not math.isfinite(tracking_lag) or tracking_lag < 0:
+            raise ValueError("Tracking lag must be finite and non-negative.")
         target = np.asarray(action, dtype=np.float64)
         measured = np.asarray(measured_joints, dtype=np.float64)
         if (
@@ -74,7 +82,7 @@ class JointLimits:
                 f"received position={target[7]:g}, force level={target[8]:g}."
             )
         velocity = np.minimum(self.velocity, max_velocity)
-        delta = np.minimum(max_step, velocity * period)
+        delta = np.minimum(max_step, velocity * (period + tracking_lag))
         low, high = measured - delta, measured + delta
         if previous_target is not None:
             previous = np.asarray(previous_target, dtype=np.float64)

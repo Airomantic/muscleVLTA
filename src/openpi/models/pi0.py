@@ -172,17 +172,25 @@ class Pi0(_model.BaseModel):
         self.use_force_history = config.use_force_history
         self.cross_attention_latency = config.cross_attention_latency
         self.force_dim = config.force_dim
+        self.force_history_frames = config.force_history_frames
+        self.memory_frames = config.memory_frames
+        self.gripper_head_index = config.gripper_head_index
+        self.gripper_loss_weight = config.gripper_loss_weight
         self.tactile_in_use = config.tactile_in_use
         self.tactile_feature_size = config.tactile_num_sensors * config.tactile_feature_dim
         self.force_encoder = config.force_encoder if config.reactive_in_use else "gru"
-        # Frame time of every reactive memory token (force tokens first, then the low-rate tactile tokens).
+        # Frame time of every reactive memory token (force tokens first, then the low-rate tactile tokens); negative
+        # times are force_history_frames measured before the current frame 0.
         # Stored as tuples: nnx module attributes that are not variables must be hashable.
-        self.memory_times = tuple(range(config.action_horizon))
+        force_times = tuple(range(-config.force_history_frames, config.action_horizon))
+        tactile_times_kwargs = {"history": config.force_history_frames, "anchor": config.tactile_anchor}
+        tactile_times = tactile_token_times(config.action_horizon, config.tactile_stride, **tactile_times_kwargs)
+        self.memory_times = force_times
         self.tactile_pooling = None
         if self.force_encoder == "mot" and config.tactile_in_use:
-            pooling = tactile_pooling_matrix(config.action_horizon, config.tactile_stride)
+            pooling = tactile_pooling_matrix(config.action_horizon, config.tactile_stride, **tactile_times_kwargs)
             self.tactile_pooling = tuple(map(tuple, pooling.tolist()))
-            self.memory_times += tactile_token_times(config.action_horizon, config.tactile_stride)
+            self.memory_times += tactile_times
         self.residual_image_keys = config.residual_image_keys
         self.residual_action_dim = len(config.residual_action_scale) if config.residual_policy_in_use else 0
         self.residual_action_scale = (
@@ -229,17 +237,17 @@ class Pi0(_model.BaseModel):
             if config.tactile_in_use:
                 tactile_encoder = create_tactile_encoder(config.tactile_feature_dim)
                 tactile_encoder.lazy_init(
-                    jnp.zeros((1, config.action_horizon, config.tactile_num_sensors, *config.tactile_shape)),
+                    jnp.zeros((1, config.memory_frames, config.tactile_num_sensors, *config.tactile_shape)),
                     rngs=rngs,
                 )
                 model_parts["tactile_encoder"] = tactile_encoder
             if self.force_encoder == "mot":
                 # Fast force expert (every frame) + slow tactile expert (every tactile_stride frames) sharing one
                 # time-causal self-attention; their tokens form the memory of the reactive expert's cross-attention.
-                modalities, times, input_sizes = ["force"], [tuple(range(config.action_horizon))], [config.force_dim]
+                modalities, times, input_sizes = ["force"], [force_times], [config.force_dim]
                 if config.tactile_in_use:
                     modalities.append("tactile")
-                    times.append(tactile_token_times(config.action_horizon, config.tactile_stride))
+                    times.append(tactile_times)
                     input_sizes.append(self.tactile_feature_size)
                 force_mot = create_multirate_mot(
                     modalities=tuple(modalities),
@@ -278,6 +286,9 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+        if config.gripper_head_index is not None:
+            # Open / close logit of every action step, shared by the action experts like action_out_proj.
+            self.gripper_head = nnx.Linear(action_expert_config.width, 1, rngs=rngs)
         self.deterministic = True
 
     @at.typecheck
@@ -402,12 +413,17 @@ class Pi0(_model.BaseModel):
     def _get_wrench_memory(self, observation: _model.Observation):
         batch_size = observation.state.shape[0]
         if observation.wrench is None:
-            wrench = jnp.zeros((batch_size, self.action_horizon, self.force_dim), dtype=observation.state.dtype)
+            wrench = jnp.zeros((batch_size, self.memory_frames, self.force_dim), dtype=observation.state.dtype)
         else:
             wrench = observation.wrench
         wrench_mask = self._get_wrench_mask(observation)
         if self.residual_policy_in_use:
             return self.residual_policy.wrench_gru(wrench) * wrench_mask[:, None, None]
+        if self.force_encoder == "mot" and wrench.shape[1] != self.memory_frames:
+            raise ValueError(
+                f"Expected {self.memory_frames} force frames (force_history_frames + action_horizon), "
+                f"got {wrench.shape[1]}."
+            )
         tactile_features = None
         if self.tactile_in_use:
             if observation.tactile is None:
@@ -692,6 +708,31 @@ class Pi0(_model.BaseModel):
         )
         return self._mask_residual_padding(residual_actions)
 
+    def _flow_targets(self, actions):
+        """Flow-matching targets; the dimension of the gripper classification head is zeroed (not flow-matched)."""
+        if self.gripper_head_index is None:
+            return actions
+        return actions.at[..., self.gripper_head_index].set(0.0)
+
+    def _gripper_logits(self, expert_out):
+        return self.gripper_head(expert_out[:, -self.action_horizon :])[..., 0].astype(jnp.float32)
+
+    def _gripper_loss(self, expert_out, actions):
+        """[b, ah] weighted KL divergence of the open / close head from the open fraction (normalized target + 1) / 2:
+        binary for steady open / closed targets, soft during open / close ramps. This is the cross-entropy minus the
+        label entropy (same gradients), so the loss goes to 0 at the optimum also during ramps."""
+        logits = self._gripper_logits(expert_out)
+        labels = jnp.clip((actions[..., self.gripper_head_index] + 1.0) / 2.0, 0.0, 1.0)
+        neg_entropy = jax.scipy.special.xlogy(labels, labels) + jax.scipy.special.xlogy(1.0 - labels, 1.0 - labels)
+        return self.gripper_loss_weight * (jax.nn.softplus(logits) - labels * logits + neg_entropy)
+
+    def _with_gripper(self, actions, logits):
+        """Writes 2 * p(open) - 1 (the normalized open / closed target) into the gripper dimension."""
+        if self.gripper_head_index is None:
+            return actions
+        gripper = (2.0 * jax.nn.sigmoid(logits) - 1.0).astype(actions.dtype)
+        return actions.at[..., self.gripper_head_index].set(gripper)
+
     @override
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
@@ -706,8 +747,9 @@ class Pi0(_model.BaseModel):
             batch_shape = actions.shape[:-2]
             noise = jax.random.normal(noise_rng, actions.shape)
             time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
-            x_t = time[..., None, None] * noise + (1 - time[..., None, None]) * actions
-            u_t = noise - actions
+            targets = self._flow_targets(actions)
+            x_t = time[..., None, None] * noise + (1 - time[..., None, None]) * targets
+            u_t = noise - targets
             prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
             input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
@@ -725,7 +767,10 @@ class Pi0(_model.BaseModel):
             )
             del prefix_out
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
-            return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+            loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+            if self.gripper_head_index is not None:
+                loss += self._gripper_loss(suffix_out, actions)
+            return loss
 
         preprocess_rng, noise_rng, time_rng, reac_noise_rng = jax.random.split(rng, 4)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
@@ -737,10 +782,11 @@ class Pi0(_model.BaseModel):
         reac_noise = jax.random.normal(reac_noise_rng, actions.shape)
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
         time_expanded = time[..., None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
-        reac_x_t = time_expanded * reac_noise + (1 - time_expanded) * actions
-        reac_u_t = reac_noise - actions
+        targets = self._flow_targets(actions)
+        x_t = time_expanded * noise + (1 - time_expanded) * targets
+        u_t = noise - targets
+        reac_x_t = time_expanded * reac_noise + (1 - time_expanded) * targets
+        reac_u_t = reac_noise - targets
 
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
@@ -765,9 +811,15 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
         reac_v_t = self.action_out_proj(reacfix_out[:, -self.action_horizon :])
+        loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        if self.gripper_head_index is not None:
+            loss += self._gripper_loss(suffix_out, actions)
         if self.original_head:
-            return jnp.mean(jnp.square(v_t - u_t), axis=-1)
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1) + jnp.mean(jnp.square(reac_v_t - reac_u_t), axis=-1)
+            return loss
+        loss += jnp.mean(jnp.square(reac_v_t - reac_u_t), axis=-1)
+        if self.gripper_head_index is not None:
+            loss += self._gripper_loss(reacfix_out, actions)
+        return loss
 
     @override
     def sample_actions(
@@ -800,7 +852,7 @@ class Pi0(_model.BaseModel):
             )
 
             def step(carry):
-                x_t, time = carry
+                x_t, time, logits = carry
                 suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
                     observation, x_t, jnp.broadcast_to(time, batch_size)
                 )
@@ -819,13 +871,16 @@ class Pi0(_model.BaseModel):
                     cross_attn_mask=jnp.zeros((batch_size, 1, 1, 1), dtype=bool),
                 )
                 v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
-                return x_t + dt * v_t, time + dt
+                if self.gripper_head_index is not None:
+                    logits = self._gripper_logits(suffix_out)
+                return x_t + dt * v_t, time + dt, logits
 
             def cond(carry):
                 return carry[1] >= -dt / 2
 
-            x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
-            return x_0
+            logits = jnp.zeros((batch_size, self.action_horizon), jnp.float32)
+            x_0, _, logits = jax.lax.while_loop(cond, step, (noise, 1.0, logits))
+            return self._with_gripper(x_0, logits)
 
         observation = _model.preprocess_observation(None, observation, train=False)
         dt = -1.0 / num_steps
@@ -895,7 +950,7 @@ class Pi0(_model.BaseModel):
             )
 
         def step(carry):
-            x_t, reac_x_t, time = carry
+            x_t, reac_x_t, time, logits = carry
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
                 observation, x_t, jnp.broadcast_to(time, batch_size)
             )
@@ -931,13 +986,16 @@ class Pi0(_model.BaseModel):
             )
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
             reac_v_t = self.action_out_proj(reacfix_out[:, -self.action_horizon :])
-            return x_t + dt * v_t, reac_x_t + dt * reac_v_t, time + dt
+            if self.gripper_head_index is not None:
+                logits = self._gripper_logits(suffix_out if self.original_head else reacfix_out)
+            return x_t + dt * v_t, reac_x_t + dt * reac_v_t, time + dt, logits
 
         def cond(carry):
             return carry[2] >= -dt / 2
 
-        x_0, reac_x_0, _ = jax.lax.while_loop(cond, step, (noise, reac_noise, 1.0))
-        return x_0 if self.original_head else reac_x_0
+        logits = jnp.zeros((batch_size, self.action_horizon), jnp.float32)
+        x_0, reac_x_0, _, logits = jax.lax.while_loop(cond, step, (noise, reac_noise, 1.0, logits))
+        return self._with_gripper(x_0 if self.original_head else reac_x_0, logits)
 
     def sample_actions_rtc(
         self,
@@ -951,6 +1009,8 @@ class Pi0(_model.BaseModel):
         num_steps: int = 10,
         prefix_attention_schedule: PrefixAttentionSchedule = "exp",
     ) -> _model.Actions:
+        if self.gripper_head_index is not None:
+            raise NotImplementedError("sample_actions_rtc does not support gripper_head_index.")
         observation = _model.preprocess_observation(None, observation, train=False)
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]

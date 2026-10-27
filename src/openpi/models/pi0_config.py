@@ -50,6 +50,20 @@ class Pi0Config(_model.BaseModelConfig):
     mot_width: int = 256
     mot_depth: int = 2
     mot_num_heads: int = 4
+    # Measured force / tactile frames before the current frame (time 0) in the reactive memory: the wrench / tactile
+    # inputs then hold force_history_frames + action_horizon frames, oldest first (requires the "mot" encoder). The
+    # first cross_attention_latency actions then also see contact forces, and the end of the previous action chunk is
+    # carried into the next one.
+    force_history_frames: int = 0
+    # Place the slow tactile tokens at times = action_horizon - 1 - cross_attention_latency (mod tactile_stride), so the
+    # newest token is visible to the last action (the default 0, stride, ... can hide the last tokens behind the latency).
+    align_tactile_tokens: bool = False
+    # Action dimension predicted by a separate open / close classification head (sigmoid, trained with the KL divergence
+    # from the open fraction (normalized target + 1) / 2: binary for steady targets, soft during open / close ramps)
+    # instead of flow matching, e.g. 7 for the AR3 gripper. Its flow-matching target is zeroed and sampling writes
+    # 2 * p(open) - 1 into it. gripper_loss_weight scales the per-step loss of every action expert.
+    gripper_head_index: int | None = None
+    gripper_loss_weight: float = 1.0
 
     # The residual branch reuses the frozen base-policy SigLIP. These settings
     # control only the trainable correction decoder and wrench encoder.
@@ -93,6 +107,23 @@ class Pi0Config(_model.BaseModelConfig):
                 raise ValueError("tactile_stride and mot_depth must be positive.")
             if self.mot_width % self.mot_num_heads != 0 or (self.mot_width // self.mot_num_heads) % 2 != 0:
                 raise ValueError("mot_width must be divisible by mot_num_heads (with an even head dim).")
+        if self.force_history_frames < 0:
+            raise ValueError("force_history_frames must be non-negative.")
+        if self.force_history_frames and not (
+            self.reactive_in_use and self.force_encoder == "mot" and self.use_force_history
+        ):
+            raise ValueError(
+                "force_history_frames requires reactive_in_use, force_encoder='mot' and use_force_history."
+            )
+        if self.align_tactile_tokens and self.force_encoder != "mot":
+            raise ValueError("align_tactile_tokens requires force_encoder='mot'.")
+        if self.gripper_head_index is not None:
+            if self.residual_policy_in_use:
+                raise ValueError("gripper_head_index is not supported with residual_policy_in_use.")
+            if not 0 <= self.gripper_head_index < self.action_dim:
+                raise ValueError(f"gripper_head_index must be in [0, {self.action_dim}).")
+            if self.gripper_loss_weight < 0:
+                raise ValueError("gripper_loss_weight must be non-negative.")
         if self.residual_policy_in_use:
             if not self.residual_image_keys:
                 raise ValueError("residual_image_keys must contain at least one image key.")
@@ -125,6 +156,16 @@ class Pi0Config(_model.BaseModelConfig):
 
         return Pi0(self, rngs=nnx.Rngs(rng))
 
+    @property
+    def memory_frames(self) -> int:
+        """Frames of the wrench / tactile inputs: force_history_frames + action_horizon."""
+        return self.force_history_frames + self.action_horizon
+
+    @property
+    def tactile_anchor(self) -> int:
+        """Frame time that the slow tactile tokens are aligned to (see align_tactile_tokens)."""
+        return self.action_horizon - 1 - self.cross_attention_latency if self.align_tactile_tokens else 0
+
     @override
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
@@ -132,13 +173,13 @@ class Pi0Config(_model.BaseModelConfig):
 
         with at.disable_typechecking():
             wrench_spec = (
-                jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.force_dim], jnp.float32)
+                jax.ShapeDtypeStruct([batch_size, self.memory_frames, self.force_dim], jnp.float32)
                 if self.reactive_in_use or self.residual_policy_in_use
                 else None
             )
             tactile_spec = (
                 jax.ShapeDtypeStruct(
-                    [batch_size, self.action_horizon, self.tactile_num_sensors, *self.tactile_shape], jnp.float32
+                    [batch_size, self.memory_frames, self.tactile_num_sensors, *self.tactile_shape], jnp.float32
                 )
                 if self.tactile_in_use
                 else None

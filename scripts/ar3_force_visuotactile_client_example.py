@@ -35,14 +35,23 @@ Observation sent to the server (layout of the training data, see src/openpi/poli
     prompt                        str                          task instruction (default: the episode task / PROMPT)
 
 A single reading is used for the whole chunk; (t, ...) arrays are readings of consecutive steps since the chunk start.
+Models trained with force history (server metadata "force_history_frames" = h > 0, e.g. the v2 configs) receive
+(h + t, ...) arrays: the h readings before the chunk start (the end of the previous chunk; at the start of the run the
+first reading repeated, like the episode start during training), followed by the readings since the chunk start.
+The v2 configs ignore observation/force_level (constant in the recordings).
 Every response contains actions of shape (n, 9) at the 15 Hz dataset rate:
 
     actions[:, :7]   absolute joint position targets [rad]
-    actions[:, 7]    gripper position target (0..1000, 0 = closed)
+    actions[:, 7]    gripper position target (0..1000, 0 = closed); v2: open / close head, snapped to 0 or 1000
     actions[:, 8]    gripper force level command (20..100)
 
 Before execution the client clips the gripper position and force level to their ranges and the joint targets to the
 measured joints +- --max-joint-step [rad]; joint limits, workspace and velocity limits stay the job of the driver.
+Live execution (--source ros --execute) streams the bounded joint targets to the position controller like the
+teleoperation that recorded the training data: setpoints interpolated over one control period, published at
+--stream-rate (100 Hz) and reached after --command-horizon (0.08 s), so the arm moves continuously at the policy rate
+instead of stopping at every action (--stream-rate 0: one blocking trajectory point per action). --gripper-speed
+defaults to the SDK speed of the recordings (80).
 Joint torques and finger wrenches are inputs only: the recordings contain no torque commands, so the policy does not
 predict joint forces. Contact forces result from tracking the joint / gripper targets with the commanded force level.
 
@@ -351,6 +360,7 @@ def run_policy(
     prompt: str,
     tactile_shape: Sequence[int] | None = None,
     reactive_k: int = 1,
+    force_history: int = 0,
     execute_steps: int = 0,
     num_chunks: int = 0,
     max_steps: int = 0,
@@ -361,22 +371,31 @@ def run_policy(
     """Runs the policy until the robot is done or the chunk / step budget is used. Returns the number of steps.
 
     Every step observes the robot first (readings of step i are taken before action i is executed, as in the
-    recordings), then queries the server if needed, executes one action and calls the callbacks.
+    recordings), then queries the server if needed, executes one action and calls the callbacks. With
+    force_history = h > 0 (server metadata "force_history_frames"), every request puts the h readings before the
+    chunk start in front of the readings since the chunk start.
     """
     if mode not in ("chunk", "reactive"):
         raise ValueError(f"Unknown mode {mode!r}")
+    if force_history < 0:
+        raise ValueError(f"force_history must be >= 0, got {force_history}")
     steps_per_chunk = action_horizon if mode == "reactive" else min(execute_steps or action_horizon, action_horizon)
     rate = Rate(fps)
     start_time = time.monotonic()
     index = 0
     chunk = 0
+    # The last force_history readings per key, carried across chunks.
+    past: dict[str, collections.deque[np.ndarray]] = collections.defaultdict(
+        lambda: collections.deque(maxlen=force_history)
+    )
 
     def budget_left() -> bool:
         return not getattr(robot, "done", False) and (max_steps <= 0 or index < max_steps)
 
     while budget_left() and (num_chunks <= 0 or chunk < num_chunks):
         pending: collections.deque[np.ndarray] = collections.deque()
-        history: dict[str, list[np.ndarray]] = {}
+        history: dict[str, list[np.ndarray]] = {}  # readings since the chunk start
+        before: dict[str, list[np.ndarray]] = {}  # the force_history readings before the chunk start
         for chunk_step in range(steps_per_chunk):
             if not budget_left():
                 break
@@ -385,14 +404,16 @@ def run_policy(
             request = result = None
             call_start = time.monotonic()
             if chunk_step == 0:
+                history = {key: [value] for key, value in readings.items()}
+                before = {key: history_window(past[key], value, force_history) for key, value in readings.items()}
                 # Chunk start: full observation, the VLM runs once for this chunk.
+                sent = {**observation, **stack_readings(before, history)} if force_history else observation
                 if mode == "reactive":
-                    history = {key: [value] for key, value in readings.items()}
                     request = "replan"
-                    result = client.reactive_replan({**observation, "prompt": prompt}, k=reactive_k)
+                    result = client.reactive_replan({**sent, "prompt": prompt}, k=reactive_k)
                 else:
                     request = "infer"
-                    result = client.infer({**observation, "prompt": prompt})
+                    result = client.infer({**sent, "prompt": prompt})
             elif mode == "reactive":
                 if readings.keys() != history.keys():
                     raise RuntimeError(f"Readings changed within a chunk: {sorted(readings)} vs {sorted(history)}")
@@ -401,9 +422,7 @@ def run_policy(
                 if not pending:
                     # All readings since the chunk start (images / state / prompt stay the replan ones).
                     request = "step"
-                    result = client.reactive_step(
-                        {key: np.stack(values) for key, values in history.items()}, k=reactive_k
-                    )
+                    result = client.reactive_step(stack_readings(before, history), k=reactive_k)
                     if result.get("start_step") != chunk_step:
                         raise RuntimeError(f"Server is at step {result.get('start_step')}, client at {chunk_step}")
             round_trip_ms = (time.monotonic() - call_start) * 1000 if request else None
@@ -452,10 +471,27 @@ def run_policy(
                 step.action = acknowledged
             for callback in callbacks:
                 callback(step)
+            if force_history:
+                for key in past.keys() - readings.keys():
+                    del past[key]  # The history of a key must be contiguous.
+                for key, value in readings.items():
+                    past[key].append(value)
             index += 1
             rate.sleep()
         chunk += 1
     return index
+
+
+def history_window(past: Sequence[np.ndarray], current: np.ndarray, length: int) -> list[np.ndarray]:
+    """The `length` readings before `current`, oldest first. Like the training sequences, which are clamped at the
+    episode start, missing readings at the start of the run repeat the first reading."""
+    readings = list(past)[-length:] if length > 0 else []
+    return [readings[0] if readings else current] * (length - len(readings)) + readings
+
+
+def stack_readings(before: dict[str, list[np.ndarray]], history: dict[str, list[np.ndarray]]) -> dict[str, np.ndarray]:
+    """Per key, the readings before the chunk start followed by the readings since the chunk start."""
+    return {key: np.stack([*before[key], *values]) for key, values in history.items()}
 
 
 def log_request(step: Step) -> None:
@@ -1035,6 +1071,10 @@ def make_robot(args: argparse.Namespace, metadata: dict) -> AR3Robot:
                 str(args.command_timeout),
                 "--gripper-speed",
                 str(args.gripper_speed),
+                "--stream-rate",
+                str(args.stream_rate),
+                "--command-horizon",
+                str(args.command_horizon),
             ]
             if args.initialize_gripper:
                 worker_args.append("--initialize-gripper")
@@ -1128,7 +1168,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-target-deviation", type=float, default=0.25, help="reject larger model/state gaps [rad]"
     )
     control.add_argument("--command-timeout", type=float, default=0.5, help="independent worker watchdog deadline [s]")
-    control.add_argument("--gripper-speed", type=int, default=20, help="SDK speed setting [1..100]")
+    control.add_argument(
+        "--gripper-speed",
+        type=int,
+        default=80,
+        help="SDK speed setting [1..100] (recordings: 80, lerobot oneClick.sh gripper teleop)",
+    )
+    control.add_argument(
+        "--stream-rate",
+        type=float,
+        default=100.0,
+        help="rate of the interpolated joint setpoints [Hz] (recording teleoperation: 100); 0: one blocking "
+        "trajectory point per action, the arm stops at every control step",
+    )
+    control.add_argument(
+        "--command-horizon",
+        type=float,
+        default=0.08,
+        help="time_from_start of the streamed setpoints [s] (recording teleoperation: 0.08)",
+    )
     outputs = parser.add_argument_group("outputs")
     outputs.add_argument("--output-dir", default=None, help="write rollout.npz and summary.json")
     outputs.add_argument("--rerun", default=None, help="spawn | FILE.rrd | rerun+http://HOST:9876/proxy")
@@ -1169,6 +1227,12 @@ def validate_execution_args(args: argparse.Namespace) -> None:
             raise ValueError("--command-timeout must exceed one control period and be <= 2 seconds.")
         if not 1 <= args.gripper_speed <= 100:
             raise ValueError("--gripper-speed must be in 1..100.")
+        if args.stream_rate != 0 and not (np.isfinite(args.stream_rate) and args.fps <= args.stream_rate <= 500):
+            raise ValueError("--stream-rate must be 0 (blocking points) or between --fps and 500 Hz.")
+        if args.stream_rate and not (
+            np.isfinite(args.command_horizon) and 1 / args.stream_rate < args.command_horizon <= 0.2
+        ):
+            raise ValueError("--command-horizon must exceed one --stream-rate period and be <= 0.2 seconds.")
 
 
 def run(args: argparse.Namespace, *, policy_client=None) -> dict[str, Any]:
@@ -1189,6 +1253,8 @@ def run(args: argparse.Namespace, *, policy_client=None) -> dict[str, Any]:
         raise ValueError(f"--reactive-k must be in [1, {action_horizon}], got {reactive_k}")
     if not 0 <= args.execute_steps <= action_horizon:
         raise ValueError(f"--execute-steps must be in [0, {action_horizon}], got {args.execute_steps}")
+    # Readings before the chunk start that the model was trained with (0 for models without force history).
+    force_history = int(metadata.get("force_history_frames", 0))
 
     prompt = args.prompt or PROMPT
     fps = args.fps if args.fps is not None else (0.0 if args.source == "dataset" else DATASET_FPS)
@@ -1204,6 +1270,7 @@ def run(args: argparse.Namespace, *, policy_client=None) -> dict[str, Any]:
             prompt=prompt,
             tactile_shape=metadata.get("tactile_shape"),
             reactive_k=reactive_k,
+            force_history=force_history,
             execute_steps=args.execute_steps,
             num_chunks=1,
             fps=0,
@@ -1215,9 +1282,10 @@ def run(args: argparse.Namespace, *, policy_client=None) -> dict[str, Any]:
     prompt = args.prompt or getattr(robot, "task", None) or PROMPT
     episode = getattr(robot, "episode", None)
     logging.info(
-        "Running %s mode%s with %s%s, prompt %r",
+        "Running %s mode%s%s with %s%s, prompt %r",
         mode,
         f" (k={reactive_k})" if mode == "reactive" else "",
+        f", {force_history} force history readings" if force_history else "",
         args.source,
         f" episode {episode}" if episode is not None else "",
         prompt,
@@ -1245,6 +1313,7 @@ def run(args: argparse.Namespace, *, policy_client=None) -> dict[str, Any]:
             prompt=prompt,
             tactile_shape=metadata.get("tactile_shape"),
             reactive_k=reactive_k,
+            force_history=force_history,
             execute_steps=args.execute_steps,
             num_chunks=args.num_chunks,
             max_steps=args.max_steps,
@@ -1286,6 +1355,7 @@ def run(args: argparse.Namespace, *, policy_client=None) -> dict[str, Any]:
         "config_name": metadata.get("config_name"),
         "mode": mode,
         "reactive_k": reactive_k if mode == "reactive" else None,
+        "force_history_frames": force_history,
         "source": args.source,
         "read_only": read_only,
         "dataset": args.dataset if args.source == "dataset" else None,

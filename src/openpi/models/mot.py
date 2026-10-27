@@ -93,19 +93,26 @@ class _LinenMultiRateMoT(nn.Module):
         self([jnp.zeros((1, len(t), d)) for t, d in zip(self.times, self.input_sizes, strict=True)])
 
 
-def tactile_token_times(action_horizon: int, stride: int) -> tuple[int, ...]:
-    """Frame indices of the low-rate tactile tokens: 0, stride, 2 * stride, ... (< action_horizon)."""
-    return tuple(range(0, action_horizon, stride))
+def tactile_token_times(action_horizon: int, stride: int, *, history: int = 0, anchor: int = 0) -> tuple[int, ...]:
+    """Frame times of the low-rate tactile tokens: every t in [-history, action_horizon) with t = anchor (mod stride).
+
+    The defaults give 0, stride, 2 * stride, ...; negative times are history frames before the current one (0).
+    """
+    return tuple(t for t in range(-history, action_horizon) if (t - anchor) % stride == 0)
 
 
-def tactile_pooling_matrix(action_horizon: int, stride: int) -> np.ndarray:
-    """[num_tokens, action_horizon] causal averaging: token j averages the frames (time_{j-1}, time_j]."""
-    times = tactile_token_times(action_horizon, stride)
-    matrix = np.zeros((len(times), action_horizon), dtype=np.float32)
+def tactile_pooling_matrix(action_horizon: int, stride: int, *, history: int = 0, anchor: int = 0) -> np.ndarray:
+    """[num_tokens, history + action_horizon] causal averaging over the frames -history .. action_horizon - 1.
+
+    Token j averages the frames (time_{j-1}, time_j]; the first token averages every frame from -history on.
+    """
+    times = tactile_token_times(action_horizon, stride, history=history, anchor=anchor)
+    matrix = np.zeros((len(times), history + action_horizon), dtype=np.float32)
     start = 0
     for index, time in enumerate(times):
-        matrix[index, start : time + 1] = 1.0 / (time + 1 - start)
-        start = time + 1
+        end = time + history + 1
+        matrix[index, start:end] = 1.0 / (end - start)
+        start = end
     return matrix
 
 

@@ -8,17 +8,22 @@ Dataset (LeRobot v3.0, 15 fps) features used for training:
   force channels are fed to the reactive force branch instead (late force injection, see LIFT).
 * ``action`` (9D): 7 joint position targets [rad], gripper position target (0..1000), gripper force level (20..100).
 * ``observation.arm_effort`` (7D) and ``observation.gripper_wrench.sensor_{0,2}`` (6D each, Fx Fy Fz Mx My Mz in each
-  finger sensor's own SDK frame) form the 19D measured force sequence of the reactive branch. The commanded gripper
-  force level (``action[..., 8]`` during training, ``observation/force_level`` at inference) is appended after
-  normalization with its fixed 20..100 range (it is constant in many recordings, so quantile statistics would be
-  degenerate), giving the 20D force input of the model (MODEL_FORCE_DIM).
+  finger sensor's own SDK frame) form the 19D measured force sequence of the reactive branch. Optionally
+  (``use_force_level``), the commanded gripper force level (``action[..., 8]`` during training,
+  ``observation/force_level`` at inference) is appended after normalization with its fixed 20..100 range, giving a 20D
+  force input (MODEL_FORCE_DIM). It is constant (80) in the recordings, so the v2 configs drop it (19D force input).
 * ``observation.tactile_depth`` (optional, native sidecars): visuo-tactile depth images of the two fingers.
+
+With ``history_frames`` > 0 the force / tactile sequences also hold that many readings before the current frame
+(oldest first), so the first actions of a chunk see recent contact forces and the client carries the end of the
+previous chunk into the next one.
 
 The two finger sensors face each other, so their local frames are mirrored. The raw local frames are kept by default:
 every force channel is normalized independently (quantile normalization) and mixed by the learned input layer of the
-force encoder, so a fixed sign / axis permutation between the frames does not change what the model can learn. Set
-``finger_wrench_2_rotation`` to express the sensor_2 wrench in the sensor_0 frame if a physically aligned frame is
-preferred (the same rotation is then applied during training and inference).
+force encoder. Set ``finger_wrench_2_rotation`` (e.g. FINGER_WRENCH_2_TO_0_ROTATION, used by the v2 configs) to
+express the sensor_2 wrench in the sensor_0 frame, so that both fingers' readings share one frame (a drag or bump
+along the fingers has the same sign on both, a squeeze has opposite normal forces); the same rotation is then applied
+during training and inference.
 """
 
 import dataclasses
@@ -47,6 +52,13 @@ FORCE_LEVEL_NAME = "gripper.force_level"
 # Range of the gripper force level command (SDK units), mapped linearly to [-1, 1].
 FORCE_LEVEL_RANGE = (20.0, 100.0)
 FORCE_LEVEL_ACTION_INDEX = ACTION_NAMES.index(FORCE_LEVEL_NAME)
+GRIPPER_ACTION_INDEX = ACTION_NAMES.index("gripper.position_sdk")
+# Closed / open gripper position targets (SDK units) of the recordings.
+GRIPPER_RANGE = (0.0, 1000.0)
+# Row-major rotation (180 degrees about y) mapping sensor_2 force / moment vectors into the sensor_0 frame: the finger
+# sensors face each other, so their normals (z) and one shear axis (x) are anti-parallel. Estimated from closed-grip
+# recordings: raw corr(Fz0, Fz2) = +0.58 (same squeeze seen in mirrored frames), corr(Fx0, Fx2) = -0.52.
+FINGER_WRENCH_2_TO_0_ROTATION = (-1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0)
 
 STATE_DIM = len(STATE_NAMES)
 ACTION_DIM = len(ACTION_NAMES)
@@ -90,20 +102,25 @@ def _parse_image(image) -> np.ndarray:
     return image
 
 
-def _to_sequence(value, horizon: int, item_ndim: int) -> np.ndarray:
-    """Returns a [horizon, ...] float32 sequence.
+def _to_sequence(value, horizon: int, item_ndim: int, history: int = 0) -> np.ndarray:
+    """Returns a [history + horizon, ...] float32 sequence, oldest first (the current frame is at index history).
 
-    Single readings (inference) are repeated and shorter sequences are padded with their last reading, which matches
+    A single reading (inference) is repeated for every frame. Sequences hold ``history`` readings before the current
+    one followed by at least the current reading; shorter sequences are padded with their last reading, which matches
     the clamping of sequences at the end of an episode during training.
     """
     value = np.asarray(value, dtype=np.float32)
     if value.ndim == item_ndim:
-        value = value[None]
-    if value.ndim != item_ndim + 1 or value.shape[0] == 0:
-        raise ValueError(f"Expected a reading with {item_ndim} dims or a sequence of readings, got {value.shape}")
-    if value.shape[0] < horizon:
-        value = np.concatenate([value, np.repeat(value[-1:], horizon - value.shape[0], axis=0)], axis=0)
-    return value[:horizon]
+        value = np.repeat(value[None], history + 1, axis=0)
+    if value.ndim != item_ndim + 1 or value.shape[0] <= history:
+        raise ValueError(
+            f"Expected a reading with {item_ndim} dims or a sequence of {history} history readings followed by the "
+            f"current reading(s), got {value.shape}"
+        )
+    length = history + horizon
+    if value.shape[0] < length:
+        value = np.concatenate([value, np.repeat(value[-1:], length - value.shape[0], axis=0)], axis=0)
+    return value[:length]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -112,8 +129,11 @@ class AR3ForceVisuotactileInputs(transforms.DataTransformFn):
 
     # Determines which model will be used.
     model_type: _model.ModelType
-    # Length of the force / tactile sequences (the action horizon of the model).
+    # Length of the force / tactile sequences after the current frame (the action horizon of the model).
     action_horizon: int = 15
+    # Readings before the current frame in the force / tactile sequences (Pi0Config.force_history_frames): the
+    # sequences hold history_frames + action_horizon frames, oldest first.
+    history_frames: int = 0
     # Feed the 19D force sequence (arm effort + two finger wrenches) to the reactive force branch.
     use_force: bool = True
     # Feed the tactile depth images to the model (requires ``Pi0Config.tactile_in_use``).
@@ -172,9 +192,10 @@ class AR3ForceVisuotactileInputs(transforms.DataTransformFn):
         return inputs
 
     def _force(self, data: dict) -> np.ndarray | None:
+        sequence = {"horizon": self.action_horizon, "item_ndim": 1, "history": self.history_frames}
         if "wrench" in data:
             # Pre-assembled 19D force readings (e.g. sent by the robot client).
-            wrench = _to_sequence(data["wrench"], self.action_horizon, item_ndim=1)
+            wrench = _to_sequence(data["wrench"], **sequence)
             if wrench.shape[-1] != FORCE_DIM:
                 raise ValueError(f"Expected {FORCE_DIM}D force readings {FORCE_NAMES}, got {wrench.shape}")
             return wrench
@@ -183,7 +204,7 @@ class AR3ForceVisuotactileInputs(transforms.DataTransformFn):
             if any(key in data for key in keys):
                 raise ValueError(f"Force inputs require all of {keys}, got {[key for key in keys if key in data]}")
             return None
-        effort, wrench_0, wrench_2 = (_to_sequence(data[key], self.action_horizon, item_ndim=1) for key in keys)
+        effort, wrench_0, wrench_2 = (_to_sequence(data[key], **sequence) for key in keys)
         if effort.shape[-1] != NUM_ARM_JOINTS or wrench_0.shape[-1] != 6 or wrench_2.shape[-1] != 6:
             raise ValueError(f"Unexpected force shapes: {effort.shape}, {wrench_0.shape}, {wrench_2.shape}")
         if self.finger_wrench_2_rotation is not None:
@@ -194,17 +215,21 @@ class AR3ForceVisuotactileInputs(transforms.DataTransformFn):
     def _force_level(self, data: dict) -> np.ndarray:
         if FORCE_LEVEL_KEY in data:
             level = np.asarray(data[FORCE_LEVEL_KEY], dtype=np.float32).reshape(-1, 1)
+            if level.shape[0] == 1:
+                level = level[0]  # A single reading.
         elif "actions" in data:
-            # Training: the commanded force level of every step of the chunk (absolute, unaffected by delta actions).
+            # Training: the commanded force level of every step of the chunk (absolute, unaffected by delta actions),
+            # with the first one repeated for the history frames.
             level = np.asarray(data["actions"], dtype=np.float32)[
                 ..., FORCE_LEVEL_ACTION_INDEX : FORCE_LEVEL_ACTION_INDEX + 1
             ]
+            level = np.concatenate([np.repeat(level[:1], self.history_frames, axis=0), level], axis=0)
         else:
-            level = np.full((1, 1), self.default_force_level, dtype=np.float32)
-        return _to_sequence(level, self.action_horizon, item_ndim=1)
+            level = np.full((1,), self.default_force_level, dtype=np.float32)
+        return _to_sequence(level, self.action_horizon, item_ndim=1, history=self.history_frames)
 
     def _tactile(self, value) -> np.ndarray:
-        tactile = _to_sequence(value, self.action_horizon, item_ndim=3)
+        tactile = _to_sequence(value, self.action_horizon, item_ndim=3, history=self.history_frames)
         height, width = self.tactile_resolution
         if tactile.shape[-2:] != (height, width):
             tactile = np.stack(
@@ -238,5 +263,14 @@ class AR3AppendForceLevel(transforms.DataTransformFn):
 class AR3ForceVisuotactileOutputs(transforms.DataTransformFn):
     """Converts model outputs back to AR3 actions (inference only)."""
 
+    # Snap the gripper target to open / closed at this SDK position (e.g. 500 for a gripper classification head,
+    # whose unnormalized output is p(open) * 1000); None keeps the predicted position.
+    gripper_threshold: float | None = None
+
     def __call__(self, data: dict) -> dict:
-        return {"actions": np.asarray(data["actions"][:, :ACTION_DIM])}
+        actions = np.array(data["actions"][:, :ACTION_DIM])
+        if self.gripper_threshold is not None:
+            closed, opened = GRIPPER_RANGE
+            gripper = actions[:, GRIPPER_ACTION_INDEX]
+            actions[:, GRIPPER_ACTION_INDEX] = np.where(gripper >= self.gripper_threshold, opened, closed)
+        return {"actions": actions}

@@ -276,6 +276,10 @@ def create_torch_data_loader(
             local_batch_size = batch_size
     else:
         local_batch_size = batch_size // jax.process_count()
+    if sampler is None and shuffle and (weights := _change_oversampling_weights(dataset, data_config)) is not None:
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights, num_samples=len(weights), replacement=True, generator=torch.Generator().manual_seed(seed)
+        )
 
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(
@@ -291,6 +295,35 @@ def create_torch_data_loader(
     )
 
     return DataLoaderImpl(data_config, data_loader)
+
+
+def _change_oversampling_weights(dataset: Dataset, data_config: _config.DataConfig) -> np.ndarray | None:
+    """Per-sample weights of DataConfig.change_oversampling_* (None if disabled)."""
+    key = data_config.change_oversampling_key
+    if key is None or data_config.change_oversampling_weight == 1.0:
+        return None
+    if data_config.change_oversampling_weight <= 0:
+        raise ValueError("change_oversampling_weight must be positive.")
+    base = dataset
+    while isinstance(base, TransformedDataset):
+        base = base._dataset  # noqa: SLF001
+    if not isinstance(base, _lerobot_v3.LeRobotV3Dataset):
+        raise ValueError("change_oversampling_key requires a LeRobot v3.0 dataset.")
+    flags = base.sequence_change_flags(
+        key, data_config.change_oversampling_dim, threshold=data_config.change_oversampling_threshold
+    )
+    weight = data_config.change_oversampling_weight
+    logging.info(
+        "Oversampling %d of %d samples (%.1f%%) whose %s[%d] changes within the chunk by %gx (%.1f%% of the draws).",
+        flags.sum(),
+        len(flags),
+        100 * flags.mean(),
+        key,
+        data_config.change_oversampling_dim,
+        weight,
+        100 * weight * flags.sum() / (weight * flags.sum() + (~flags).sum()),
+    )
+    return np.where(flags, weight, 1.0)
 
 
 class TorchDataLoader:

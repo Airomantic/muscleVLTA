@@ -67,6 +67,9 @@ def server_metadata(config: _config.TrainConfig, policy_metadata: dict | None = 
     }
     if metadata["reactive"]:
         metadata["cross_attention_latency"] = model.cross_attention_latency
+    if getattr(model, "force_history_frames", 0):
+        # Force / tactile readings before the chunk start that every request must carry (oldest first).
+        metadata["force_history_frames"] = model.force_history_frames
     if getattr(model, "tactile_in_use", False):
         metadata["tactile_shape"] = list(model.tactile_shape)
     return {**metadata, **(policy_metadata or {})}

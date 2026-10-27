@@ -87,9 +87,10 @@ class Observation(Generic[ArrayT]):
     image_masks: dict[str, at.Bool[ArrayT, "*b"]]
     # Low-dimensional robot state.
     state: at.Float[ArrayT, "*b s"]
+    # Force readings over [force history +] the action horizon: [*b, time, force_dim].
     wrench: at.Float[ArrayT, "*b t q"] | None = None
     wrench_mask: at.Bool[ArrayT, "*b"] | None = None
-    # Optional visuo-tactile images over the action horizon: [*b, time, sensors, height, width].
+    # Optional visuo-tactile images on the same time axis as wrench: [*b, time, sensors, height, width].
     tactile: at.Float[ArrayT, "*b t tn th tw"] | None = None
 
     # Tokenized prompt.

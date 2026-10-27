@@ -85,6 +85,10 @@ class LeRobotV3Options:
     tactile: TactileOptions | None = None
     # Optional subset of episode indices. ``None`` uses all episodes.
     episodes: tuple[int, ...] | None = None
+    # Rows before the current one prepended to the sequences of ``history_keys`` (sequence keys and / or the tactile
+    # key), clamped to the first row of the episode: those sequences hold history_length + sequence_length rows.
+    history_length: int = 0
+    history_keys: tuple[str, ...] = ()
     # Number of video files kept open per (worker) process.
     max_open_videos: int = 16
     # Number of per-episode tactile caches kept memory-mapped per (worker) process.
@@ -281,6 +285,11 @@ class LeRobotV3Dataset:
         if unknown := sorted(set(sequence_keys) - set(numeric_keys)):
             raise ValueError(f"Unknown sequence keys {unknown}. Numeric features: {numeric_keys}")
         self.sequence_keys = tuple(sequence_keys)
+        if self.options.history_length < 0:
+            raise ValueError(f"history_length must be non-negative, got {self.options.history_length}")
+        history_targets = set(self.sequence_keys) | ({self.options.tactile.key} if self.options.tactile else set())
+        if unknown := sorted(set(self.options.history_keys) - history_targets):
+            raise ValueError(f"History keys {unknown} are neither sequence keys nor the tactile key")
         self.video_keys = tuple(self.meta.video_keys if self.options.video_keys is None else self.options.video_keys)
         if unknown := sorted(set(self.video_keys) - set(self.meta.video_keys)):
             raise ValueError(f"Unknown video keys {unknown}. Video features: {self.meta.video_keys}")
@@ -304,9 +313,11 @@ class LeRobotV3Dataset:
             if not np.array_equal(self._arrays["frame_index"][start:end], np.arange(length)):
                 raise ValueError(f"Episode {episode_index}: frame indices are not consecutive from 0")
             self._episode_bounds[episode_index] = (start, end)
-        # Last row (inclusive) of the episode of every row, used to clamp sequences at the episode end.
+        # First / last row (inclusive) of the episode of every row, used to clamp sequences to the episode.
+        self._episode_first_row = np.empty(len(episode_column), dtype=np.int64)
         self._episode_last_row = np.empty(len(episode_column), dtype=np.int64)
         for start, end in self._episode_bounds.values():
+            self._episode_first_row[start:end] = start
             self._episode_last_row[start:end] = end - 1
 
         valid = np.ones(len(episode_column), dtype=bool)
@@ -370,9 +381,16 @@ class LeRobotV3Dataset:
         rows = np.arange(row, row + self.sequence_length)
         is_pad = rows > last_row
         rows = np.minimum(rows, last_row)
+        history = self.options.history_length
+        history_rows = np.arange(row - history, row + self.sequence_length)
+        history_is_pad = (history_rows < self._episode_first_row[row]) | (history_rows > last_row)
+        history_rows = np.clip(history_rows, self._episode_first_row[row], last_row)
         for key in self.sequence_keys:
-            item[key] = self._arrays[key][rows]
-            item[f"{key}_is_pad"] = is_pad
+            key_rows, key_is_pad = (
+                (history_rows, history_is_pad) if key in self.options.history_keys else (rows, is_pad)
+            )
+            item[key] = self._arrays[key][key_rows]
+            item[f"{key}_is_pad"] = key_is_pad
 
         timestamp = float(self._arrays["timestamp"][row])
         for key in self.video_keys:
@@ -380,10 +398,25 @@ class LeRobotV3Dataset:
 
         if (tactile := self.options.tactile) is not None:
             start, _ = self._episode_bounds[episode_index]
-            item[tactile.key] = np.asarray(self._tactile_map(episode_index)[rows - start])
+            tactile_rows = history_rows if tactile.key in self.options.history_keys else rows
+            item[tactile.key] = np.asarray(self._tactile_map(episode_index)[tactile_rows - start])
 
         item["task"] = self.meta.tasks[int(self._arrays["task_index"][row])]
         return item
+
+    def sequence_change_flags(self, key: str, dim: int, *, threshold: float = 0.0) -> np.ndarray:
+        """Per sample: whether ``key[..., dim]`` varies by more than ``threshold`` within the sample's window.
+
+        The window holds the sequence_length rows from the sample on, clamped to the episode end (e.g. the action
+        chunk), so the flags mark e.g. chunks containing a gripper open / close action.
+        """
+        if key not in self._arrays:
+            raise ValueError(f"Unknown key {key!r}")
+        column = self._arrays[key]
+        values = column.reshape(len(column), -1)[:, dim].astype(np.float64)
+        rows = self._samples[:, None] + np.arange(self.sequence_length)[None]
+        rows = np.minimum(rows, self._episode_last_row[self._samples][:, None])
+        return np.ptp(values[rows], axis=1) > threshold
 
     def _load_frames(self, keys: Sequence[str], optional_keys: Sequence[str]) -> dict[str, np.ndarray]:
         keys = list(dict.fromkeys(keys))

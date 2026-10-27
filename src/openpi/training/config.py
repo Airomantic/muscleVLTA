@@ -141,6 +141,14 @@ class DataConfig:
     # with it (using default options if this is None).
     lerobot_v3: _lerobot_v3.LeRobotV3Options | None = None
 
+    # Shuffled LeRobot v3.0 training data: draw the samples whose change_oversampling_key[..., change_oversampling_dim]
+    # varies by more than change_oversampling_threshold within the action horizon (e.g. chunks with a gripper open /
+    # close action) change_oversampling_weight times more often (sampling with replacement). 1 disables it.
+    change_oversampling_key: str | None = None
+    change_oversampling_dim: int = 0
+    change_oversampling_threshold: float = 0.0
+    change_oversampling_weight: float = 1.0
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -333,6 +341,12 @@ class LeRobotAR3ForceVisuotactileDataConfig(DataConfigFactory):
     finger_wrench_2_rotation: tuple[float, ...] | None = None
     # Append the commanded gripper force level (action dim 8) to the 19D measured force input (-> 20D).
     use_force_level: bool = True
+    # Draw action chunks in which the gripper target changes by more than gripper_change_threshold SDK units (open /
+    # close actions, ~12% of the 15-step chunks) this many times more often during training (1 disables it).
+    gripper_change_oversampling: float = 1.0
+    gripper_change_threshold: float = 50.0
+    # Snap the predicted gripper target to open / closed at this SDK position (for Pi0Config.gripper_head_index).
+    gripper_output_threshold: float | None = None
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -349,6 +363,11 @@ class LeRobotAR3ForceVisuotactileDataConfig(DataConfigFactory):
             )
         if use_tactile and getattr(model_config, "tactile_num_sensors", None) != len(ar3.TACTILE_SENSORS):
             raise ValueError(f"AR3 tactile inputs come from {ar3.TACTILE_SENSORS}; set Pi0Config.tactile_num_sensors.")
+        if getattr(model_config, "gripper_head_index", None) not in (None, ar3.GRIPPER_ACTION_INDEX):
+            raise ValueError(
+                f"The AR3 gripper target is action dim {ar3.GRIPPER_ACTION_INDEX}; set gripper_head_index."
+            )
+        history_frames = getattr(model_config, "force_history_frames", 0) if use_force or use_tactile else 0
 
         repack_structure = {
             ar3.FRONT_IMAGE_KEY: self.front_video_key,
@@ -358,6 +377,7 @@ class LeRobotAR3ForceVisuotactileDataConfig(DataConfigFactory):
             "prompt": "task",
         }
         sequence_keys = ["action"]
+        history_keys = []
         if use_force:
             force_keys = {
                 ar3.ARM_EFFORT_KEY: "observation.arm_effort",
@@ -366,6 +386,7 @@ class LeRobotAR3ForceVisuotactileDataConfig(DataConfigFactory):
             }
             repack_structure.update(force_keys)
             sequence_keys.extend(force_keys.values())
+            history_keys.extend(force_keys.values())
         tactile_options = None
         if use_tactile:
             tactile_options = _lerobot_v3.TactileOptions(
@@ -374,12 +395,14 @@ class LeRobotAR3ForceVisuotactileDataConfig(DataConfigFactory):
                 cache_dir=self.tactile_cache_dir,
             )
             repack_structure[ar3.TACTILE_KEY] = tactile_options.key
+            history_keys.append(tactile_options.key)
 
         data_transforms = _transforms.Group(
             inputs=[
                 ar3.AR3ForceVisuotactileInputs(
                     model_type=model_config.model_type,
                     action_horizon=model_config.action_horizon,
+                    history_frames=history_frames,
                     use_force=use_force,
                     use_tactile=use_tactile,
                     tactile_resolution=tuple(getattr(model_config, "tactile_shape", (72, 96))),
@@ -388,7 +411,7 @@ class LeRobotAR3ForceVisuotactileDataConfig(DataConfigFactory):
                     use_force_level=self.use_force_level,
                 )
             ],
-            outputs=[ar3.AR3ForceVisuotactileOutputs()],
+            outputs=[ar3.AR3ForceVisuotactileOutputs(gripper_threshold=self.gripper_output_threshold)],
         )
         if self.delta_joint_actions:
             joint_mask = _transforms.make_bool_mask(ar3.NUM_ARM_JOINTS)
@@ -410,7 +433,13 @@ class LeRobotAR3ForceVisuotactileDataConfig(DataConfigFactory):
                 require_valid=self.require_valid,
                 tactile=tactile_options,
                 episodes=self.episodes,
+                history_length=history_frames,
+                history_keys=tuple(history_keys) if history_frames else (),
             ),
+            change_oversampling_key="action",
+            change_oversampling_dim=ar3.GRIPPER_ACTION_INDEX,
+            change_oversampling_threshold=self.gripper_change_threshold,
+            change_oversampling_weight=self.gripper_change_oversampling,
         )
 
 
@@ -668,6 +697,32 @@ pi05_ar3_force_visuotactile_reactive_lora = dataclasses.replace(
     action_expert_variant="gemma_300m_lora",
     reactive_action_expert_variant="gemma_300m_lora",
 )
+
+# v2 of the AR3 force-reactive model: a 2 step (0.13 s) cross-attention latency, the force / tactile memory also holds
+# the 5 frames before the chunk start (so the first actions of a chunk react to contact as well), the slow tactile
+# tokens are aligned so that the newest one is visible to the last action, the 19D measured force input drops the
+# constant gripper force level, and the gripper target is predicted by an open / close classification head.
+pi05_ar3_force_visuotactile_reactive_v2 = dataclasses.replace(
+    pi05_ar3_force_visuotactile_reactive,
+    cross_attention_latency=2,
+    force_dim=ar3_force_visuotactile_policy.FORCE_DIM,
+    force_history_frames=5,
+    align_tactile_tokens=True,
+    gripper_head_index=ar3_force_visuotactile_policy.GRIPPER_ACTION_INDEX,
+    gripper_loss_weight=0.1,
+)
+
+
+def _ar3_v2_data(**kwargs: Any) -> LeRobotAR3ForceVisuotactileDataConfig:
+    """AR3 data config of the v2 models: no force level input, both finger wrenches in the sensor_0 frame, gripper
+    open / close chunks drawn 3x more often, and the gripper classification output snapped to open / closed."""
+    return LeRobotAR3ForceVisuotactileDataConfig(
+        use_force_level=False,
+        finger_wrench_2_rotation=ar3_force_visuotactile_policy.FINGER_WRENCH_2_TO_0_ROTATION,
+        gripper_change_oversampling=3.0,
+        gripper_output_threshold=500.0,
+        **kwargs,
+    )
 
 
 def _ar3_train_config(name: str, model: pi0_config.Pi0Config, **kwargs: Any) -> TrainConfig:
@@ -1004,6 +1059,13 @@ _CONFIGS = [
         ema_decay=None,
         save_interval=500,
     ),
+    # v2 (see pi05_ar3_force_visuotactile_reactive_v2): force history, latency 2, aligned tactile tokens, 19D force,
+    # finger wrenches in one frame, gripper open / close head with oversampled open / close chunks.
+    _ar3_train_config(
+        "pi05_ar3_force_visuotactile_reactive_v2",
+        pi05_ar3_force_visuotactile_reactive_v2,
+        data=_ar3_v2_data(repo_id=_DEFAULT_AR3_REPO_ID, assets=AssetsConfig(asset_id=_DEFAULT_AR3_ASSET_ID)),
+    ),
     # CPU smoke test on the single-episode dataset_example (no videos -> black frames, random tiny model).
     TrainConfig(
         name="pi05_ar3_force_visuotactile_reactive_debug",
@@ -1033,6 +1095,46 @@ _CONFIGS = [
         weight_loader=weight_loaders.NoOpWeightLoader(),
         copy_reactive_from_action_expert=True,
         # The SigLIP image tower is not shrunk by the dummy variants; freeze it to keep the smoke test small.
+        freeze_filter=nnx_utils.PathRegex(".*img.*"),
+        overwrite=True,
+        save_interval=1,
+        log_interval=1,
+        plot_interval=0,
+        keep_period=1,
+        num_train_steps=2,
+        fsdp_devices=1,
+        wandb_enabled=False,
+        exp_name="debug",
+    ),
+    # CPU smoke test of the v2 options (2 history frames, latency 1).
+    TrainConfig(
+        name="pi05_ar3_force_visuotactile_reactive_v2_debug",
+        model=dataclasses.replace(
+            pi05_ar3_force_visuotactile_reactive_v2,
+            paligemma_variant="dummy",
+            action_expert_variant="dummy",
+            reactive_action_expert_variant="dummy",
+            cross_attention_config="dummy",
+            action_horizon=4,
+            cross_attention_latency=1,
+            force_history_frames=2,
+            tactile_feature_dim=16,
+            tactile_stride=2,
+            mot_width=32,
+            mot_depth=1,
+        ),
+        data=_ar3_v2_data(
+            repo_id=_AR3_EXAMPLE_REPO_ID,
+            assets=AssetsConfig(asset_id="ar3_dataset_example"),
+            missing_video="black",
+        ),
+        batch_size=2,
+        num_workers=0,
+        lr_schedule=_optimizer.RsqrtDecaySchedule(warmup_steps=1, peak_lr=5e-5, timescale=10),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        copy_reactive_from_action_expert=True,
         freeze_filter=nnx_utils.PathRegex(".*img.*"),
         overwrite=True,
         save_interval=1,
