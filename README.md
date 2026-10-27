@@ -128,6 +128,27 @@ bash scripts/train_ar3_force_visuotactile_gpu67_lowmem.sh
 See the script headers for overrides (dataset, weights, GPUs, batch size, resume). At inference, send
 `observation/force_level` (the commanded gripper force level) in addition to the force and tactile readings.
 
+#### AR3 v2 (`pi05_ar3_force_visuotactile_reactive_v2`)
+
+`scripts/train_ar3_g2_force_visuotactile_gpu012345.sh` fully fine-tunes the v2 config on GPUs 0–5 by default
+(`OPENPI_CONFIG_NAME` selects another config; CPU smoke test `pi05_ar3_force_visuotactile_reactive_v2_debug`).
+Compared to `pi05_ar3_force_visuotactile_reactive`:
+
+- **19D force input** (7 torques + 2×6D finger wrenches) without the constant gripper force level. The sensor_2
+  finger wrench is rotated into the sensor_0 frame (`diag(-1, 1, -1)`), so both fingers report a contact in one frame.
+- **Force history and latency**: the force / tactile sequences also hold the 5 frames before the chunk start
+  (`force_history_frames`), so the first actions of a chunk react to contact as well; cross-attention latency 2
+  instead of 3 (reactive `k` = 3). The slow tactile tokens are aligned so that the newest one is visible to the
+  last action of the chunk.
+- **Gripper open / close head**: the gripper target is classified (open / closed, weight 0.1) instead of flow
+  matched and is output as 0 or 1000. Chunks in which the gripper target changes by more than 50 units are drawn
+  3× more often.
+
+Use `--config-name pi05_ar3_force_visuotactile_reactive_v2` for v2 checkpoints (VS Code: `infer_muscleVLTA_debug_v2`
+and `infer_muscleVLTA_LIVE_v2`, checkpoint copied to `infer_checkpoint/v2`). The server reports
+`force_history_frames`, and the client then sends the readings of the 5 control steps before every chunk start
+automatically. The previous configs and their checkpoints are unchanged.
+
 #### AR3 inference
 
 ##### Laptop preparation and read-only VS Code debug
@@ -240,7 +261,8 @@ does not start a policy server, leaving GPU memory available for local debugging
 The original **`infer_muscleVLTA_debug`** remains prediction-only. The separate VS Code configuration
 **`infer_muscleVLTA_LIVE (MOVES ARM + GRIPPER)`** uses `--source ros --execute` and will send real targets
 (**`infer_muscleVLTA_LIVE_fineTuning (MOVES ARM + GRIPPER)`** does the same with the full fine-tuned checkpoint;
-its `_recordParquet` variant also records every run, see [Recording LIVE runs](#recording-live-runs-parquet)).
+its `_recordParquet` variant also records every run, see [Recording LIVE runs](#recording-live-runs-parquet);
+**`infer_muscleVLTA_LIVE_v2 (MOVES ARM + GRIPPER)`** runs a v2 checkpoint).
 Stop the read-only model first to free its GPU memory. Only start LIVE with a clear workspace, a verified
 starting pose and checkpoint/action units, no teleoperation/replay/MoveIt goal, and an accessible physical
 emergency stop. Do not attach a debugger to the independent control worker.
@@ -249,10 +271,21 @@ The LIVE configuration runs up to **300 control steps** with repeated closed-loo
 a stop. This is 20 seconds at the nominal 15 Hz; inference and controller waits can make the run longer.
 The step budget is not automatic task-completion detection. Joint target increments remain limited to
 0.03 rad and joint command velocity to 0.1 rad/s; raw model targets farther than 0.25 rad from feedback
-are rejected, and gripper SDK speed remains 10. The worker additionally reads actual URDF joint limits and
+are rejected. The gripper SDK speed is 80, as in the recordings (gripper teleoperation of lerobot `oneClick.sh`:
+`--speed 80 --force 80 --rate 20`; the former LIVE setting 10 was far slower than the demonstrations). The worker
+additionally reads actual URDF joint limits and
 requires the active seven-joint position controller, fresh controller/sensor feedback, and exclusive discovered
 command ownership. These limits are not collision checking or a guarantee of safe contact. Other private gRPC
 clients cannot be discovered; ensure no other program commands the gripper.
+
+**Joint command streaming.** The recordings were teleoperated with single-point `JointTrajectory` commands at about
+100 Hz, each 0.08 s ahead. Publishing one point per 15 Hz action and waiting for it (the former behavior, still
+available with `--stream-rate 0`) brings the arm to rest at every control step, which shows up as tremor. By default
+(`--stream-rate 100 --command-horizon 0.08`), the worker interpolates linearly from the previous setpoint to each
+bounded action target over one control period and streams the setpoints at 100 Hz like the teleoperation, so the
+arm moves continuously. The velocity bound allows for the streaming lag (horizon + one stream period); a stream
+failure stops the arm through the watchdog. The demonstrations reach 0.15 (p90) to 0.24 rad/s per joint, so with
+0.1 rad/s the arm can lag behind fast segments; raise `--max-joint-velocity` only after validating the motion.
 
 As in replay/preview, the client clips finite gripper predictions to the SDK ranges: position **0..1000**
 and force level **20..100**. This includes LIVE; small endpoint overshoots do not abort a run. Each adjustment
