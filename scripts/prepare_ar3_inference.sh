@@ -190,7 +190,13 @@ command_for() {
                 color_width:=640 color_height:=480 color_fps:=30 "color_format:=$format"
                 enable_depth:=false enable_point_cloud:=false enable_colored_point_cloud:=false
                 enable_frame_sync:=false)
-            [[ "$1" == front ]] || COMMAND+=(uvc_backend:=v4l2 enable_left_color:=false enable_right_color:=false) ;;
+            if [[ "$1" == wrist ]]; then
+                # Match lerobot_89236e_muscleTWAM/examples/rokae_ar3/record_force_training.json.
+                # Explicit manual controls prevent AE/AWB from washing out the close-up image.
+                COMMAND+=(uvc_backend:=v4l2 enable_left_color:=false enable_right_color:=false
+                    enable_color_auto_exposure:=false color_exposure:=80 color_gain:=16
+                    enable_color_auto_white_balance:=false color_white_balance:=4600)
+            fi ;;
         tilt)
             TASK_CWD="$TILT_DIR"
             COMMAND=("${ROS_CMD[@]}" /usr/bin/python3 "$TILT_DIR/camera_tilt_ros2.py" --ros-args

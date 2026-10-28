@@ -193,6 +193,13 @@ The readiness tab requires actual sensor messages, measured tilt feedback, and v
 gripper feedback, not only advertised topics or a responsive gRPC service. The front camera uses MJPG;
 the Gemini 305 wrist camera uses its supported **YUYV** profile at 640x480/30 FPS with the **V4L2** UVC
 backend. On this setup, libuvc can report the wrist camera online but produce no frames even with YUYV.
+Each wrist camera startup also applies the same manual RGB controls as the collection project's
+`examples/rokae_ar3/record_force_training.json`: exposure **80** (SDK units), gain **16**, white balance
+**4600 K**, with auto exposure and auto white balance both disabled. These launch arguments prevent
+the driver defaults from enabling automatic controls and washing out the close-up image. To apply an
+update, stop inference and the existing `wrist` camera tab with Ctrl+C, then start only that camera with
+`./infer_oneclick.sh --task wrist` before resuming inference. Restarting F5 alone leaves the ROS camera
+process and its controls running.
 
 The readiness task also connects the gripper's CAN interface (`can0`, motor ID `1`) if disconnected,
 then waits for valid feedback. The connection stays open on the server for inference; the hardware
